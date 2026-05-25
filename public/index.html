@@ -705,8 +705,8 @@ const $ = id => document.getElementById(id);
 // CONFIG
 // ══════════════════════════════════════════════════════════
 const CFG = {
-  WS_URL: 'wss://ws.derivws.com/websockets/v3?app_id=1089',
-  APP_ID: 1089,
+  APP_ID: (window.__NEXUS_OVERRIDES__&&window.__NEXUS_OVERRIDES__.APP_ID)||1089,
+  get WS_URL(){ return 'wss://ws.derivws.com/websockets/v3?app_id='+this.APP_ID; },
   TICK_COUNT: 250,
   MIN_CONF_AUTO: 72,
   MAX_ACTIVE: 5,
@@ -757,42 +757,66 @@ const API = (() => {
   let ws=null, token=null, reqId=1, pingInt=null, reconnTimer=null, reconnAttempts=0;
   const pending={}, tickSubs={}, tickPrices={};
 
-  function connect(t,type='demo'){
-    token=t; S.accountType=type; reconnAttempts=0; _open();
+ function connect(t,type='demo'){
+    token=(t||'').replace(/[\s'"]/g,'').replace(/[^\x20-\x7E]/g,'').trim();
+    S.accountType=type; reconnAttempts=0;
+    if(!token||token.length<10){
+      UI.toast('Invalid Token','Token appears invalid. Get it from app.deriv.com → Account Settings → API Token.','error');
+      return;
+    }
+    _open();
   }
   function _open(){
-    if(ws&&ws.readyState<=1)ws.close();
+    if(ws){try{ws.onopen=null;ws.onmessage=null;ws.onerror=null;ws.onclose=null;ws.close();}catch(e){}}
+    ws=null;
     UI.setStatus('connecting');
-    ws=new WebSocket(CFG.WS_URL);
+    try{ ws=new WebSocket(CFG.WS_URL); }
+    catch(e){
+      UI.toast('Connection Error','Could not open WebSocket. Check your internet connection.','error');
+      UI.setStatus('disconnected'); return;
+    }
     ws.onopen=()=>{
       reconnAttempts=0; _startPing();
-      _send({authorize:token},(r)=>{
-        if(r.error){UI.toast('Auth Failed',r.error.message,'error');UI.setStatus('disconnected');return;}
-        const a=r.authorize;
-        S.balance=parseFloat(a.balance); S.currency=a.currency;
-        S.loginid=a.loginid; S.connected=true;
-        UI.setStatus('connected'); UI.updateBal();
-        _send({balance:1,subscribe:1});
-        _send({transaction:1,subscribe:1});
-        _send({portfolio:1},(pr)=>{
-          if(!pr.error)(pr.portfolio.contracts||[]).forEach(c=>{
-            _send({proposal_open_contract:1,contract_id:c.contract_id,subscribe:1});
-            S.activeTrades++;
+      setTimeout(()=>{
+        _send({authorize:token},(r)=>{
+          if(r.error){
+            const msg=r.error.message||'Authorization failed';
+            const hint=(msg.toLowerCase().includes('validation')||msg.toLowerCase().includes('invalid'))
+              ? 'Token invalid. Go to app.deriv.com → Account Settings → API Token → create a new token with Read + Trade scopes enabled.'
+              : msg;
+            UI.toast('Auth Failed',hint,'error');
+            UI.setStatus('disconnected'); return;
+          }
+          const a=r.authorize;
+          S.balance=parseFloat(a.balance)||0; S.currency=a.currency||'USD';
+          S.loginid=a.loginid||''; S.connected=true;
+          UI.setStatus('connected'); UI.updateBal();
+          _send({balance:1,subscribe:1});
+          _send({transaction:1,subscribe:1});
+          _send({portfolio:1},(pr)=>{
+            if(!pr.error)(pr.portfolio.contracts||[]).forEach(c=>{
+              _send({proposal_open_contract:1,contract_id:c.contract_id,subscribe:1});
+              S.activeTrades++;
+            });
+            UI.updateMetrics();
           });
-          UI.updateMetrics();
+          Ticker.start();
+          Dashboard.init();
+          UI.toast('Connected ✓',`${S.accountType.toUpperCase()} — ${a.loginid} | ${a.currency} ${parseFloat(a.balance).toFixed(2)}`,'success');
         });
-        Ticker.start();
-        Dashboard.init();
-        UI.toast('Connected ✓',`${type.toUpperCase()} — ${a.loginid} | ${a.currency} ${parseFloat(a.balance).toFixed(2)}`,'success');
-      });
+      },300);
     };
     ws.onmessage=e=>{
-      try{_handle(JSON.parse(e.data));}catch(err){console.error(err);}
+      try{_handle(JSON.parse(e.data));}catch(err){console.error('[WS parse]',err);}
     };
-    ws.onerror=e=>console.error('[WS]',e);
-    ws.onclose=()=>{
+    ws.onerror=e=>{
+      console.error('[WS error]',e);
+      UI.toast('Connection Error','WebSocket error — check your internet connection.','error');
+    };
+    ws.onclose=(e)=>{
       _stopPing();
       if(S.connected){S.connected=false;UI.setStatus('disconnected');_schedReconn();}
+      else if(reconnAttempts===0){_schedReconn();}
     };
   }
   function _schedReconn(){
@@ -1423,10 +1447,14 @@ const Auth = (() => {
     el.classList.add('active');
     $('rwarn').style.display=t==='real'?'block':'none';
   }
-  function connect(){
-    const t=$('tokenIn').value.trim();
+function connect(){
+    const raw=$('tokenIn').value||'';
+    const t=raw.replace(/[\s'"]/g,'').replace(/[^\x20-\x7E]/g,'').trim();
     if(!t){UI.toast('Missing Token','Please paste your Deriv API token','error');return;}
-    close();API.connect(t,_type);
+    if(t.length<10){UI.toast('Invalid Token','That does not look like a valid Deriv token. Please check and try again.','error');return;}
+    close();
+    $('tokenIn').value='';
+    API.connect(t,_type);
   }
   function oauth(){
     const url='https://oauth.deriv.com/oauth2/authorize?app_id=1089&l=EN&brand=deriv';
