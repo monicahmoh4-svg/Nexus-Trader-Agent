@@ -756,10 +756,17 @@ const S = {
 const API = (() => {
   let ws=null, token=null, reqId=1, pingInt=null, reconnTimer=null, reconnAttempts=0;
   const pending={}, tickSubs={}, tickPrices={};
+// All WS endpoints to try in order
+  const WS_ENDPOINTS=[
+    'wss://ws.derivws.com/websockets/v3?app_id=1089',
+    'wss://ws.binaryws.com/websockets/v3?app_id=1089',
+    'wss://frontend.binaryws.com/websockets/v3?app_id=1089',
+  ];
+  let wsEndpointIdx=0;
 
- function connect(t,type='demo'){
+  function connect(t,type='demo'){
     token=(t||'').replace(/[\s'"]/g,'').replace(/[^\x20-\x7E]/g,'').trim();
-    S.accountType=type; reconnAttempts=0;
+    S.accountType=type; reconnAttempts=0; wsEndpointIdx=0;
     if(!token||token.length<10){
       UI.toast('Invalid Token','Token appears invalid. Get it from app.deriv.com → Account Settings → API Token.','error');
       return;
@@ -770,13 +777,40 @@ const API = (() => {
     if(ws){try{ws.onopen=null;ws.onmessage=null;ws.onerror=null;ws.onclose=null;ws.close();}catch(e){}}
     ws=null;
     UI.setStatus('connecting');
-    try{ ws=new WebSocket(CFG.WS_URL); }
+    const endpoint=WS_ENDPOINTS[wsEndpointIdx%WS_ENDPOINTS.length];
+    console.log('[WS] Connecting to',endpoint);
+    try{ ws=new WebSocket(endpoint); }
     catch(e){
-      UI.toast('Connection Error','Could not open WebSocket. Check your internet connection.','error');
-      UI.setStatus('disconnected'); return;
+      console.error('[WS] Failed to create WebSocket:',e);
+      // Try next endpoint
+      wsEndpointIdx++;
+      if(wsEndpointIdx<WS_ENDPOINTS.length){
+        UI.toast('Retrying...','Trying alternate server...','info');
+        setTimeout(()=>_open(),1000);
+      } else {
+        UI.toast('Connection Error','Cannot connect to Deriv. Check your internet and try again.','error');
+        UI.setStatus('disconnected');
+      }
+      return;
     }
-    ws.onopen=()=>{
-      reconnAttempts=0; _startPing();
+    // Connection timeout — if no open after 10s, try next endpoint
+    const connTimeout=setTimeout(()=>{
+      if(!ws||ws.readyState!==1){
+        console.warn('[WS] Connection timeout, trying next endpoint');
+        wsEndpointIdx++;
+        if(wsEndpointIdx<WS_ENDPOINTS.length){
+          UI.toast('Slow connection...','Trying alternate server...','info');
+          _open();
+        } else {
+          UI.toast('Connection Failed','All servers unreachable. Check your internet connection.','error');
+          UI.setStatus('disconnected');
+        }
+      }
+    },10000);
+ws.onopen=()=>{
+      clearTimeout(connTimeout);
+      reconnAttempts=0; wsEndpointIdx=0; _startPing();
+      console.log('[WS] Connected. Authorizing...');
       setTimeout(()=>{
         _send({authorize:token},(r)=>{
           if(r.error){
@@ -809,20 +843,43 @@ const API = (() => {
     ws.onmessage=e=>{
       try{_handle(JSON.parse(e.data));}catch(err){console.error('[WS parse]',err);}
     };
-    ws.onerror=e=>{
+ws.onerror=e=>{
+      clearTimeout(connTimeout);
       console.error('[WS error]',e);
-      UI.toast('Connection Error','WebSocket error — check your internet connection.','error');
     };
     ws.onclose=(e)=>{
+      clearTimeout(connTimeout);
       _stopPing();
-      if(S.connected){S.connected=false;UI.setStatus('disconnected');_schedReconn();}
-      else if(reconnAttempts===0){_schedReconn();}
+      console.log('[WS] Closed. Code:',e.code,'Reason:',e.reason,'WasClean:',e.wasClean);
+      if(S.connected){
+        S.connected=false;
+        UI.setStatus('disconnected');
+        UI.toast('Disconnected','Connection lost. Reconnecting...','info');
+        _schedReconn();
+      } else if(!S.connected && token) {
+        // Failed before auth — try next endpoint
+        wsEndpointIdx++;
+        if(wsEndpointIdx<WS_ENDPOINTS.length){
+          console.log('[WS] Trying next endpoint...');
+          setTimeout(()=>_open(),1500);
+        } else {
+          wsEndpointIdx=0;
+          _schedReconn();
+        }
+      }
     };
   }
-  function _schedReconn(){
-    if(reconnAttempts>=8)return;
+function _schedReconn(){
+    if(reconnAttempts>=8){
+      UI.toast('Connection Failed','Could not reconnect after 8 attempts. Please refresh the page.','error');
+      UI.setStatus('disconnected');
+      return;
+    }
     const d=Math.min(3000*Math.pow(1.5,reconnAttempts),30000);
-    reconnAttempts++; UI.setStatus('connecting');
+    reconnAttempts++;
+    wsEndpointIdx=0; // Reset endpoint on reconnect
+    UI.setStatus('connecting');
+    console.log(`[WS] Reconnect attempt ${reconnAttempts} in ${d}ms`);
     clearTimeout(reconnTimer);
     reconnTimer=setTimeout(()=>_open(),d);
   }
