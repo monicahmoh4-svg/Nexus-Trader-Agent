@@ -836,7 +836,9 @@ ws.onopen=()=>{
           });
           Ticker.start();
           Dashboard.init();
-          UI.toast('Connected ✓',`${S.accountType.toUpperCase()} — ${a.loginid} | ${a.currency} ${parseFloat(a.balance).toFixed(2)}`,'success');
+UI.toast('Connected ✓',`${S.accountType.toUpperCase()} — ${a.loginid} | ${a.currency} ${parseFloat(a.balance).toFixed(2)}`,'success');
+          // Warm up live data feeds immediately after auth
+          setTimeout(()=>AE.warmup(),500);
         });
       },300);
     };
@@ -1013,55 +1015,110 @@ const Ticker = (() => {
 // ANALYSIS ENGINE
 // ══════════════════════════════════════════════════════════
 const AE = (() => {
-  const avg=a=>a.reduce((s,v)=>s+v,0)/a.length;
+  const avg=a=>a.length?a.reduce((s,v)=>s+v,0)/a.length:0;
   const std=a=>{const m=avg(a);return Math.sqrt(avg(a.map(x=>(x-m)**2)));};
   const last=a=>a[a.length-1];
   const clamp=(v,mn,mx)=>Math.min(mx,Math.max(mn,v));
 
-  function rsi(prices,p=14){
-    if(prices.length<p+1)return null;
+  // ── Tick cache: stores real data per symbol ──────────────
+  const _cache={};
+  const _subs={};
+
+  // Subscribe to live ticks and accumulate into cache
+  function _ensureLiveFeed(sym){
+    if(_subs[sym])return;
+    _subs[sym]=true;
+    if(!_cache[sym])_cache[sym]={prices:[],times:[],candles:[]};
+    API.subTick(sym,({price,epoch})=>{
+      const c=_cache[sym];
+      c.prices.push(price);
+      c.times.push(epoch||Date.now()/1000);
+      if(c.prices.length>500)c.prices.shift();
+      if(c.times.length>500)c.times.shift();
+    });
+  }
+
+  // Load tick history from Deriv then keep live feed running
+  async function _loadHistory(sym){
+    _ensureLiveFeed(sym);
+    if(!_cache[sym])_cache[sym]={prices:[],times:[],candles:[]};
+    // Only fetch if we have less than 50 ticks cached
+    if(_cache[sym].prices.length>=50)return _cache[sym];
+    try{
+      const [th,ch]=await Promise.all([
+        API.getTickHist(sym,300),
+        API.getCandleHist(sym,60,100),
+      ]);
+      // Merge: history first, then any live ticks already buffered
+      const existing=_cache[sym].prices;
+      _cache[sym].prices=[...th.prices,...existing].slice(-400);
+      _cache[sym].times=[...th.times,..._cache[sym].times].slice(-400);
+      _cache[sym].candles=ch;
+    }catch(e){
+      console.warn('[AE] history fetch failed for',sym,e.message||e);
+    }
+    return _cache[sym];
+  }
+
+  // ── Indicators ───────────────────────────────────────────
+  function _rsi(prices,p=14){
+    if(prices.length<p+2)return null;
     const ch=prices.slice(1).map((x,i)=>x-prices[i]);
-    let ag=avg(ch.slice(0,p).map(c=>c>0?c:0)),al=avg(ch.slice(0,p).map(c=>c<0?-c:0));
+    let ag=avg(ch.slice(0,p).map(c=>c>0?c:0));
+    let al=avg(ch.slice(0,p).map(c=>c<0?-c:0));
     for(let i=p;i<ch.length;i++){
       ag=(ag*(p-1)+(ch[i]>0?ch[i]:0))/p;
       al=(al*(p-1)+(ch[i]<0?-ch[i]:0))/p;
     }
     return al===0?100:parseFloat((100-100/(1+ag/al)).toFixed(2));
   }
-  function ema(prices,p){
-    if(prices.length<p)return null;
-    const k=2/(p+1);let e=avg(prices.slice(0,p));
-    for(let i=p;i<prices.length;i++)e=prices[i]*k+e*(1-k);
-    return parseFloat(e.toFixed(6));
-  }
-  function emaSeries(prices,p){
+
+  function _emaSeries(prices,p){
     if(prices.length<p)return[];
-    const k=2/(p+1);const s=[];let e=avg(prices.slice(0,p));s.push(e);
+    const k=2/(p+1);const s=[];
+    let e=avg(prices.slice(0,p));s.push(e);
     for(let i=p;i<prices.length;i++){e=prices[i]*k+e*(1-k);s.push(e);}
     return s;
   }
-  function macd(prices,f=12,sl=26,sig=9){
-    if(prices.length<sl+sig)return null;
-    const fs=emaSeries(prices,f),ss=emaSeries(prices,sl);
-    const len=Math.min(fs.length,ss.length);
-    const ml=[];
-    for(let i=0;i<len;i++)ml.push(fs[fs.length-len+i]-ss[ss.length-len+i]);
-    if(ml.length<sig)return null;
-    const sigL=emaSeries(ml,sig);
-    const mv=last(ml),sv=last(sigL);
-    const h=mv-sv,ph=ml[ml.length-2]-(sigL[sigL.length-2]||sv);
-    return{macd:mv,signal:sv,histogram:parseFloat(h.toFixed(6)),prevHistogram:ph,crossUp:h>0&&ph<=0,crossDown:h<0&&ph>=0};
+  function _ema(prices,p){const s=_emaSeries(prices,p);return s.length?last(s):null;}
+
+  function _macd(prices){
+    if(prices.length<35)return null;
+    const f=_emaSeries(prices,12),s=_emaSeries(prices,26);
+    const len=Math.min(f.length,s.length);
+    const ml=Array.from({length:len},(_,i)=>f[f.length-len+i]-s[s.length-len+i]);
+    if(ml.length<9)return null;
+    const sig=_emaSeries(ml,9);
+    const h=last(ml)-last(sig);
+    const ph=ml[ml.length-2]-(sig[sig.length-2]||last(sig));
+    return{
+      macd:last(ml),signal:last(sig),
+      histogram:parseFloat(h.toFixed(7)),
+      prevHistogram:ph,
+      crossUp:h>0&&ph<=0,
+      crossDown:h<0&&ph>=0,
+      bullish:h>0,
+    };
   }
-  function bb(prices,p=20,mult=2){
+
+  function _bb(prices,p=20,mult=2){
     if(prices.length<p)return null;
     const sl=prices.slice(-p),mid=avg(sl),sd=std(sl);
-    const up=mid+mult*sd,lo=mid-mult*sd,pL=last(prices);
-    const pctB=(pL-lo)/(up-lo);
-    return{upper:up,middle:mid,lower:lo,pctB:parseFloat(pctB.toFixed(3)),bandwidth:(up-lo)/mid,
-      aboveUpper:pL>up,belowLower:pL<lo,nearUpper:pctB>0.8,nearLower:pctB<0.2,squeeze:(up-lo)/mid<0.01};
+    const up=mid+mult*sd,lo=mid-mult*sd,cur=last(prices);
+    const pctB=(cur-lo)/(up-lo||1);
+    const bw=(up-lo)/mid;
+    return{
+      upper:up,middle:mid,lower:lo,
+      pctB:parseFloat(pctB.toFixed(4)),
+      bandwidth:parseFloat(bw.toFixed(6)),
+      aboveUpper:cur>up,belowLower:cur<lo,
+      nearUpper:pctB>0.8,nearLower:pctB<0.2,
+      squeeze:bw<0.005,expansion:bw>0.02,
+    };
   }
-  function stoch(prices,kp=14,dp=3){
-    if(prices.length<kp+dp)return null;
+
+  function _stoch(prices,kp=14,dp=3){
+    if(prices.length<kp+dp+2)return null;
     const kv=[];
     for(let i=kp-1;i<prices.length;i++){
       const sl=prices.slice(i-kp+1,i+1);
@@ -1070,132 +1127,481 @@ const AE = (() => {
     }
     const dv=[];
     for(let i=dp-1;i<kv.length;i++)dv.push(avg(kv.slice(i-dp+1,i+1)));
-    const k=last(kv),d=last(dv),pk=kv[kv.length-2],pd=dv[dv.length-2];
-    return{k:parseFloat(k.toFixed(2)),d:parseFloat(d.toFixed(2)),crossUp:k>d&&pk<=pd,crossDown:k<d&&pk>=pd,overbought:k>80,oversold:k<20};
+    const k=last(kv),d=last(dv);
+    const pk=kv[kv.length-2]??k,pd=dv[dv.length-2]??d;
+    return{
+      k:parseFloat(k.toFixed(2)),d:parseFloat(d.toFixed(2)),
+      crossUp:k>d&&pk<=pd,crossDown:k<d&&pk>=pd,
+      overbought:k>80,oversold:k<20,
+    };
   }
-  function willR(prices,p=14){
+
+  function _atr(prices,p=14){
+    if(prices.length<p+2)return null;
+    const tr=prices.slice(1).map((x,i)=>Math.abs(x-prices[i]));
+    return parseFloat(avg(tr.slice(-p)).toFixed(6));
+  }
+
+  function _willR(prices,p=14){
     if(prices.length<p)return null;
     const sl=prices.slice(-p),hi=Math.max(...sl),lo=Math.min(...sl);
     return hi===lo?-50:parseFloat(((hi-last(prices))/(hi-lo)*-100).toFixed(2));
   }
-  function cci(prices,p=20){
+
+  function _cci(prices,p=20){
     if(prices.length<p)return null;
-    const sl=prices.slice(-p),tp=avg(sl),md=avg(sl.map(x=>Math.abs(x-tp)));
-    return md===0?0:parseFloat(((last(prices)-tp)/(0.015*md)).toFixed(2));
+    const sl=prices.slice(-p),tp=avg(sl);
+    const md=avg(sl.map(x=>Math.abs(x-tp)))||0.0001;
+    return parseFloat(((last(prices)-tp)/(0.015*md)).toFixed(2));
   }
-  function trend(prices,p=20){
-    if(prices.length<p*2)return{strength:0,direction:'sideways',pct:0};
-    const r=avg(prices.slice(-p)),e=avg(prices.slice(-p*2,-p));
-    const pct=(r-e)/e*100,str=clamp(Math.abs(pct)*10,0,100);
-    return{strength:parseFloat(str.toFixed(1)),direction:pct>0.1?'uptrend':pct<-0.1?'downtrend':'sideways',pct:parseFloat(pct.toFixed(4))};
+
+  function _momentum(prices,p=10){
+    if(prices.length<p+1)return null;
+    return parseFloat(((last(prices)-prices[prices.length-1-p])/prices[prices.length-1-p]*100).toFixed(4));
   }
-  function sr(prices,lb=60){
-    const sl=prices.slice(-lb),hi=Math.max(...sl),lo=Math.min(...sl),mid=(hi+lo)/2,cur=last(prices);
-    return{resistance:hi,support:lo,mid,nearResistance:cur>mid+(hi-mid)*.8,nearSupport:cur<mid-(mid-lo)*.8};
+
+  function _trendStrength(prices,p=20){
+    if(prices.length<p*2)return{strength:0,direction:'sideways'};
+    const recent=avg(prices.slice(-p));
+    const prior=avg(prices.slice(-p*2,-p));
+    const pct=(recent-prior)/prior*100;
+    const str=clamp(Math.abs(pct)*12,0,100);
+    return{
+      strength:parseFloat(str.toFixed(1)),
+      direction:pct>0.05?'uptrend':pct<-0.05?'downtrend':'sideways',
+      pct:parseFloat(pct.toFixed(5)),
+    };
   }
-  function digitFreq(prices,lb=100){
-    const digits=prices.slice(-lb).map(p=>{const s=p.toFixed(2).replace('.','');return parseInt(s[s.length-1]);});
-    const freq=Array(10).fill(0);digits.forEach(d=>freq[d]++);
-    const tot=digits.length,fp=freq.map(f=>parseFloat((f/tot*100).toFixed(1)));
-    const ec=[0,2,4,6,8].reduce((s,d)=>s+freq[d],0),oc=[1,3,5,7,9].reduce((s,d)=>s+freq[d],0);
-    const ep=ec/tot*100,op=oc/tot*100;
-    const ovc=digits.filter(d=>d>5).length,unc=digits.filter(d=>d<5).length;
-    const ovp=ovc/tot*100,unp=unc/tot*100;
-    return{freq,freqPct:fp,lastDigit:last(digits),evenPct:parseFloat(ep.toFixed(1)),oddPct:parseFloat(op.toFixed(1)),overPct:parseFloat(ovp.toFixed(1)),underPct:parseFloat(unp.toFixed(1)),evenBias:ep>54,oddBias:op>54,overBias:ovp>55,underBias:unp>55};
+
+  function _sr(prices,lb=80){
+    if(prices.length<10)return null;
+    const sl=prices.slice(-lb);
+    const hi=Math.max(...sl),lo=Math.min(...sl),mid=(hi+lo)/2;
+    const cur=last(prices);
+    return{
+      resistance:hi,support:lo,mid,
+      nearResistance:cur>hi*0.998,
+      nearSupport:cur<lo*1.002,
+      aboveMid:cur>mid,
+    };
   }
-  function candlePatterns(candles){
+
+  function _digitFreq(prices,lb=150){
+    if(prices.length<20)return null;
+    const digits=prices.slice(-lb).map(p=>{
+      const s=p.toFixed(2).replace('.','');
+      return parseInt(s[s.length-1]);
+    });
+    const freq=Array(10).fill(0);
+    digits.forEach(d=>freq[d]++);
+    const tot=digits.length;
+    const ep=[0,2,4,6,8].reduce((s,d)=>s+freq[d],0)/tot*100;
+    const op=[1,3,5,7,9].reduce((s,d)=>s+freq[d],0)/tot*100;
+    const ovp=digits.filter(d=>d>5).length/tot*100;
+    const unp=digits.filter(d=>d<5).length/tot*100;
+    // Last 10 digits to detect run patterns
+    const last10=digits.slice(-10);
+    const evenRun=last10.filter(d=>d%2===0).length;
+    const oddRun=last10.filter(d=>d%2!==0).length;
+    return{
+      freq,
+      lastDigit:last(digits),
+      evenPct:parseFloat(ep.toFixed(1)),
+      oddPct:parseFloat(op.toFixed(1)),
+      overPct:parseFloat(ovp.toFixed(1)),
+      underPct:parseFloat(unp.toFixed(1)),
+      evenBias:ep>56,oddBias:op>56,
+      overBias:ovp>57,underBias:unp>57,
+      strongEvenBias:ep>62,strongOddBias:op>62,
+      evenRun,oddRun,
+      recentEvenBias:evenRun>7,
+      recentOddBias:oddRun>7,
+    };
+  }
+
+  function _candlePatterns(candles){
     if(!candles||candles.length<3)return[];
-    const ps=[];const c=candles.slice(-3);
-    const body=x=>Math.abs(x.close-x.open);
-    const bull=x=>x.close>x.open,bear=x=>x.close<x.open;
-    const [c1,c2,c3]=c;
-    if(body(c3)<(c3.high-c3.low)*.1)ps.push({name:'Doji',bias:'neutral'});
-    const ls=c3.open>c3.close?c3.close-c3.low:c3.open-c3.low;
-    if(ls>body(c3)*2&&bear(c2))ps.push({name:'Hammer',bias:'bull'});
+    const ps=[];
+    const c=candles.slice(-5);
+    const body=x=>Math.abs((x.close||0)-(x.open||0));
+    const bull=x=>(x.close||0)>(x.open||0);
+    const bear=x=>(x.close||0)<(x.open||0);
+    const [c1,c2,c3]=c.slice(-3);
+    if(!c1||!c2||!c3)return[];
+    // Doji
+    const range=c3.high-c3.low||0.0001;
+    if(body(c3)<range*0.08)ps.push({name:'Doji',bias:'neutral',strength:1});
+    // Hammer
+    const ls=Math.min(c3.open,c3.close)-c3.low;
+    if(ls>body(c3)*2.5&&bear(c2))ps.push({name:'Hammer',bias:'bull',strength:2});
+    // Shooting Star
     const us=c3.high-Math.max(c3.open,c3.close);
-    if(us>body(c3)*2&&bull(c2))ps.push({name:'Shooting Star',bias:'bear'});
-    if(bear(c2)&&bull(c3)&&body(c3)>body(c2))ps.push({name:'Bullish Engulfing',bias:'bull'});
-    if(bull(c2)&&bear(c3)&&body(c3)>body(c2))ps.push({name:'Bearish Engulfing',bias:'bear'});
-    if(bull(c1)&&bull(c2)&&bull(c3))ps.push({name:'Three White Soldiers',bias:'bull'});
-    if(bear(c1)&&bear(c2)&&bear(c3))ps.push({name:'Three Black Crows',bias:'bear'});
+    if(us>body(c3)*2.5&&bull(c2))ps.push({name:'Shooting Star',bias:'bear',strength:2});
+    // Engulfing
+    if(bear(c2)&&bull(c3)&&body(c3)>body(c2)*1.1)ps.push({name:'Bullish Engulf',bias:'bull',strength:3});
+    if(bull(c2)&&bear(c3)&&body(c3)>body(c2)*1.1)ps.push({name:'Bearish Engulf',bias:'bear',strength:3});
+    // Three soldiers/crows
+    if(bull(c1)&&bull(c2)&&bull(c3))ps.push({name:'Three Soldiers',bias:'bull',strength:3});
+    if(bear(c1)&&bear(c2)&&bear(c3))ps.push({name:'Three Crows',bias:'bear',strength:3});
+    // Piercing / Dark Cloud
+    if(bear(c2)&&bull(c3)&&c3.close>(c2.open+c2.close)/2)ps.push({name:'Piercing Line',bias:'bull',strength:2});
+    if(bull(c2)&&bear(c3)&&c3.close<(c2.open+c2.close)/2)ps.push({name:'Dark Cloud',bias:'bear',strength:2});
     return ps;
   }
 
+  // ── Market Condition Filter ───────────────────────────────
+  // Returns true if market conditions are suitable to trade
+  function _isMarketFavourable(ind){
+    const {rsi,macd,bb,stoch,atr,trend,sr}=ind;
+    // Reject if volatility too high (price whipsawing)
+    if(atr&&bb&&atr>bb.bandwidth*8)return{ok:false,reason:'Extreme volatility — skipping'};
+    // Reject if all indicators flat/neutral
+    let neutralCount=0;
+    if(rsi&&rsi>42&&rsi<58)neutralCount++;
+    if(macd&&Math.abs(macd.histogram)<0.00001)neutralCount++;
+    if(stoch&&stoch.k>40&&stoch.k<60)neutralCount++;
+    if(neutralCount>=3)return{ok:false,reason:'Market too flat — no clear direction'};
+    // Reject sideways with no momentum
+    if(trend&&trend.direction==='sideways'&&trend.strength<5)
+      return{ok:false,reason:'Sideways consolidation — waiting for breakout'};
+    return{ok:true,reason:'Market conditions favourable'};
+  }
+
+  // ── Multi-timeframe confirmation ──────────────────────────
+  // Checks if short-term trend matches medium-term trend
+  function _multiTimeframeOk(prices,direction){
+    if(prices.length<60)return true; // not enough data, allow
+    const shortTrend=_trendStrength(prices.slice(-20),10);
+    const medTrend=_trendStrength(prices.slice(-60),30);
+    if(direction==='BUY'){
+      // Both timeframes should lean bullish or at least not strongly bearish
+      if(medTrend.direction==='downtrend'&&medTrend.strength>60)return false;
+    } else if(direction==='SELL'){
+      if(medTrend.direction==='uptrend'&&medTrend.strength>60)return false;
+    }
+    return true;
+  }
+
+  // ── Master composite analysis ─────────────────────────────
   async function analyse(sym){
-    let tickData,candleData;
-    try{[tickData,candleData]=await Promise.all([API.getTickHist(sym,250),API.getCandleHist(sym,60,100)]);}
-    catch(e){return _mock(sym);}
-    const prices=tickData.prices;
-    if(prices.length<30)return _mock(sym);
-    const R=rsi(prices,14),R7=rsi(prices,7),M=macd(prices),B=bb(prices),ST=stoch(prices);
-    const WR=willR(prices),CC=cci(prices),E9=ema(prices,9),E21=ema(prices,21),E50=ema(prices,50);
-    const TR=trend(prices,20),SR=sr(prices,60),DF=digitFreq(prices,100),PAT=candlePatterns(candleData);
-    const cur=last(prices);
-    let bull=0,bear=0,tot=0;
-    const sigs=[];
-    // RSI 18pts
-    if(R!==null){tot+=18;if(R<30){bull+=18;sigs.push({name:'RSI (14)',value:R,bias:'bull',detail:`Oversold (${R}) — reversal likely`});}else if(R>70){bear+=18;sigs.push({name:'RSI (14)',value:R,bias:'bear',detail:`Overbought (${R}) — reversal likely`});}else if(R<45){bull+=9;bear+=4;sigs.push({name:'RSI (14)',value:R,bias:'bull',detail:`Bearish zone (${R})`});}else if(R>55){bear+=9;bull+=4;sigs.push({name:'RSI (14)',value:R,bias:'bear',detail:`Bullish zone (${R})`});}else{bull+=9;bear+=9;sigs.push({name:'RSI (14)',value:R,bias:'neu',detail:`Neutral (${R})`});}}
-    // MACD 20pts
-    if(M){tot+=20;if(M.crossUp){bull+=20;sigs.push({name:'MACD',value:M.histogram.toFixed(5),bias:'bull',detail:'Bullish crossover — strong buy signal'});}else if(M.crossDown){bear+=20;sigs.push({name:'MACD',value:M.histogram.toFixed(5),bias:'bear',detail:'Bearish crossover — strong sell signal'});}else if(M.histogram>0){bull+=13;sigs.push({name:'MACD',value:M.histogram.toFixed(5),bias:'bull',detail:'Positive histogram — bullish momentum'});}else{bear+=13;sigs.push({name:'MACD',value:M.histogram.toFixed(5),bias:'bear',detail:'Negative histogram — bearish momentum'});}}
-    // BB 15pts
-    if(B){tot+=15;if(B.belowLower){bull+=15;sigs.push({name:'Bollinger Bands',value:`%B ${(B.pctB*100).toFixed(0)}%`,bias:'bull',detail:'Price below lower band — oversold bounce'});}else if(B.aboveUpper){bear+=15;sigs.push({name:'Bollinger Bands',value:`%B ${(B.pctB*100).toFixed(0)}%`,bias:'bear',detail:'Price above upper band — overbought'});}else if(B.nearLower){bull+=9;sigs.push({name:'Bollinger Bands',value:`%B ${(B.pctB*100).toFixed(0)}%`,bias:'bull',detail:'Near lower band — bullish bounce zone'});}else if(B.nearUpper){bear+=9;sigs.push({name:'Bollinger Bands',value:`%B ${(B.pctB*100).toFixed(0)}%`,bias:'bear',detail:'Near upper band — bearish reversal zone'});}else{bull+=7;bear+=7;sigs.push({name:'Bollinger Bands',value:`%B ${(B.pctB*100).toFixed(0)}%`,bias:'neu',detail:'Price inside bands — neutral'});}}
-    // EMA Cross 16pts
-    if(E9&&E21){tot+=16;const e9s=emaSeries(prices,9),e21s=emaSeries(prices,21);const ce9=last(e9s),ce21=last(e21s),pe9=e9s[e9s.length-2],pe21=e21s[e21s.length-2];if(ce9>ce21&&pe9<=pe21){bull+=16;sigs.push({name:'EMA 9/21 Cross',value:`9>${E21.toFixed(4)}`,bias:'bull',detail:'Golden cross — strong bullish signal'});}else if(ce9<ce21&&pe9>=pe21){bear+=16;sigs.push({name:'EMA 9/21 Cross',value:`9<${E21.toFixed(4)}`,bias:'bear',detail:'Death cross — strong bearish signal'});}else if(ce9>ce21){bull+=10;sigs.push({name:'EMA 9/21 Cross',value:`Above`,bias:'bull',detail:'Fast EMA above slow — bullish trend'});}else{bear+=10;sigs.push({name:'EMA 9/21 Cross',value:`Below`,bias:'bear',detail:'Fast EMA below slow — bearish trend'});}}
-    // Stoch 12pts
-    if(ST){tot+=12;if(ST.oversold&&ST.crossUp){bull+=12;sigs.push({name:'Stochastic',value:`K:${ST.k} D:${ST.d}`,bias:'bull',detail:'Oversold crossover — buy signal'});}else if(ST.overbought&&ST.crossDown){bear+=12;sigs.push({name:'Stochastic',value:`K:${ST.k} D:${ST.d}`,bias:'bear',detail:'Overbought crossover — sell signal'});}else if(ST.oversold){bull+=8;sigs.push({name:'Stochastic',value:`K:${ST.k} D:${ST.d}`,bias:'bull',detail:'Oversold zone — potential reversal'});}else if(ST.overbought){bear+=8;sigs.push({name:'Stochastic',value:`K:${ST.k} D:${ST.d}`,bias:'bear',detail:'Overbought zone — potential reversal'});}else{bull+=6;bear+=6;sigs.push({name:'Stochastic',value:`K:${ST.k} D:${ST.d}`,bias:'neu',detail:'Mid-range — no clear signal'});}}
-    // Williams %R 8pts
-    if(WR!==null){tot+=8;if(WR<-80){bull+=8;sigs.push({name:'Williams %R',value:WR,bias:'bull',detail:'Oversold (<-80)'});}else if(WR>-20){bear+=8;sigs.push({name:'Williams %R',value:WR,bias:'bear',detail:'Overbought (>-20)'});}else{bull+=4;bear+=4;sigs.push({name:'Williams %R',value:WR,bias:'neu',detail:'Neutral range'});}}
-    // CCI 8pts
-    if(CC!==null){tot+=8;if(CC<-100){bull+=8;sigs.push({name:'CCI',value:CC,bias:'bull',detail:'Oversold (<-100)'});}else if(CC>100){bear+=8;sigs.push({name:'CCI',value:CC,bias:'bear',detail:'Overbought (>+100)'});}else{bull+=4;bear+=4;sigs.push({name:'CCI',value:CC,bias:'neu',detail:'Neutral'});}}
-    // Trend 10pts
-    {tot+=10;if(TR.direction==='uptrend'){bull+=clamp(TR.strength/100*10,4,10);sigs.push({name:'Trend Strength',value:`+${TR.strength}%`,bias:'bull',detail:`Uptrend: ${TR.strength}% strength`});}else if(TR.direction==='downtrend'){bear+=clamp(TR.strength/100*10,4,10);sigs.push({name:'Trend Strength',value:`-${TR.strength}%`,bias:'bear',detail:`Downtrend: ${TR.strength}% strength`});}else{bull+=5;bear+=5;sigs.push({name:'Trend Strength',value:'0%',bias:'neu',detail:'Sideways / consolidating'});}}
-    // S/R 8pts
-    {tot+=8;if(SR.nearSupport){bull+=8;sigs.push({name:'Support/Resistance',value:SR.support.toFixed(4),bias:'bull',detail:'Near support — bounce expected'});}else if(SR.nearResistance){bear+=8;sigs.push({name:'Support/Resistance',value:SR.resistance.toFixed(4),bias:'bear',detail:'Near resistance — rejection expected'});}else{bull+=4;bear+=4;sigs.push({name:'Support/Resistance',value:`S:${SR.support.toFixed(2)} R:${SR.resistance.toFixed(2)}`,bias:'neu',detail:'Between S/R levels'});}}
-    // Digit Freq 10pts
-    {tot+=10;const db=DF.evenBias?'even':DF.oddBias?'odd':DF.overBias?'over':DF.underBias?'under':'neutral';const dBull=db!=='neutral';if(dBull)bull+=7;else{bull+=5;bear+=5;}sigs.push({name:'Digit Frequency',value:`E:${DF.evenPct}% O:${DF.oddPct}%`,bias:dBull?'bull':'neu',detail:`Bias → ${db.toUpperCase()} | Last digit: ${DF.lastDigit}`});}
-    // Candle 8pts
-    if(PAT.length>0){tot+=8;const bp=PAT.filter(p=>p.bias==='bull').length,brp=PAT.filter(p=>p.bias==='bear').length;if(bp>brp){bull+=8;}else if(brp>bp){bear+=8;}else{bull+=4;bear+=4;}sigs.push({name:'Candle Pattern',value:PAT[0].name,bias:bp>brp?'bull':brp>bp?'bear':'neu',detail:PAT.map(p=>p.name).join(' + ')});}
-    const domBull=bull>bear;const raw=tot>0?(domBull?bull:bear)/tot*100:50;
-    const conf=clamp(parseFloat(raw.toFixed(1)),50,97);
-    const dir=bull>bear?'BUY':bull<bear?'SELL':'NEUTRAL';
-    const str=conf>=85?'STRONG':conf>=72?'MODERATE':'WEAK';
-    const lbl=str==='STRONG'?`STRONG ${dir}`:str==='MODERATE'?dir:'NEUTRAL';
-    return{sym,currentPrice:cur,direction:dir,confidence:conf,strength:str,signalLabel:lbl,indicators:{rsi:R,macd:M,bb:B,stoch:ST,willR:WR,cci:CC,ema9:E9,ema21:E21,ema50:E50,trend:TR,sr:SR,dFreq:DF},signals:sigs,patterns:PAT,bullScore:parseFloat(bull.toFixed(1)),bearScore:parseFloat(bear.toFixed(1)),timestamp:Date.now()};
+    let data;
+    try{ data=await _loadHistory(sym); }
+    catch(e){ return _mock(sym,'fetch error'); }
+
+    const prices=data.prices;
+    const candles=data.candles||[];
+
+    if(prices.length<30)return _mock(sym,'insufficient data');
+
+    // Compute all indicators on real live data
+    const rsi=_rsi(prices,14);
+    const rsi7=_rsi(prices,7);
+    const macd=_macd(prices);
+    const bb=_bb(prices,20,2);
+    const stoch=_stoch(prices,14,3);
+    const atr=_atr(prices,14);
+    const willR=_willR(prices,14);
+    const cci=_cci(prices,20);
+    const ema9=_ema(prices,9);
+    const ema21=_ema(prices,21);
+    const ema50=_ema(prices,50);
+    const ema9s=_emaSeries(prices,9);
+    const ema21s=_emaSeries(prices,21);
+    const mom=_momentum(prices,10);
+    const trend=_trendStrength(prices,20);
+    const sr=_sr(prices,80);
+    const df=_digitFreq(prices,150);
+    const pats=_candlePatterns(candles);
+    const currentPrice=last(prices);
+
+    // ── Weighted scoring ──────────────────────────────────
+    let bullPts=0,bearPts=0,totalWt=0;
+    const signals=[];
+
+    function score(name,wt,bias,value,detail){
+      totalWt+=wt;
+      if(bias==='bull')bullPts+=wt;
+      else if(bias==='bear')bearPts+=wt;
+      else{bullPts+=wt*0.5;bearPts+=wt*0.5;}
+      signals.push({name,value,bias,detail});
+    }
+
+    // RSI — weight 18
+    if(rsi!==null){
+      if(rsi<25)       score('RSI (14)',18,'bull',rsi,`Strongly oversold (${rsi}) — reversal imminent`);
+      else if(rsi<35)  score('RSI (14)',18,'bull',rsi,`Oversold (${rsi}) — bounce likely`);
+      else if(rsi>75)  score('RSI (14)',18,'bear',rsi,`Strongly overbought (${rsi}) — reversal imminent`);
+      else if(rsi>65)  score('RSI (14)',18,'bear',rsi,`Overbought (${rsi}) — pullback likely`);
+      else if(rsi<48)  score('RSI (14)',18,'bull',rsi*0.6,`Below midline (${rsi}) — mild bullish`);
+      else if(rsi>52)  score('RSI (14)',18,'bear',rsi*0.6,`Above midline (${rsi}) — mild bearish`);
+      else             score('RSI (14)',18,'neu',rsi,`Neutral (${rsi})`);
+    }
+
+    // RSI7 short-term — weight 8
+    if(rsi7!==null){
+      if(rsi7<20)      score('RSI (7)',8,'bull',rsi7,`Extreme oversold short-term (${rsi7})`);
+      else if(rsi7>80) score('RSI (7)',8,'bear',rsi7,`Extreme overbought short-term (${rsi7})`);
+      else if(rsi7<40) score('RSI (7)',8,'bull',rsi7,`Short-term bearish pressure (${rsi7})`);
+      else if(rsi7>60) score('RSI (7)',8,'bear',rsi7,`Short-term bullish pressure (${rsi7})`);
+      else             score('RSI (7)',8,'neu',rsi7,`Neutral short-term (${rsi7})`);
+    }
+
+    // MACD — weight 20
+    if(macd){
+      if(macd.crossUp)        score('MACD',20,'bull',macd.histogram.toFixed(6),'Bullish crossover ↑ — strong buy');
+      else if(macd.crossDown) score('MACD',20,'bear',macd.histogram.toFixed(6),'Bearish crossover ↓ — strong sell');
+      else if(macd.bullish)   score('MACD',20,'bull',macd.histogram.toFixed(6),'Positive histogram — bullish momentum');
+      else                    score('MACD',20,'bear',macd.histogram.toFixed(6),'Negative histogram — bearish momentum');
+    }
+
+    // Bollinger Bands — weight 15
+    if(bb){
+      if(bb.belowLower)      score('Bollinger Bands',15,'bull',`%B ${(bb.pctB*100).toFixed(0)}%`,'Price below lower band — oversold bounce');
+      else if(bb.aboveUpper) score('Bollinger Bands',15,'bear',`%B ${(bb.pctB*100).toFixed(0)}%`,'Price above upper band — overbought');
+      else if(bb.nearLower)  score('Bollinger Bands',15,'bull',`%B ${(bb.pctB*100).toFixed(0)}%`,'Near lower band — bullish setup');
+      else if(bb.nearUpper)  score('Bollinger Bands',15,'bear',`%B ${(bb.pctB*100).toFixed(0)}%`,'Near upper band — bearish setup');
+      else if(bb.squeeze)    score('Bollinger Bands',15,'neu',`BW ${(bb.bandwidth*100).toFixed(2)}%`,'Squeeze — breakout imminent');
+      else                   score('Bollinger Bands',15,'neu',`%B ${(bb.pctB*100).toFixed(0)}%`,'Inside bands — neutral');
+    }
+
+    // EMA Cross — weight 16
+    if(ema9s.length>2&&ema21s.length>2){
+      const ce9=last(ema9s),ce21=last(ema21s);
+      const pe9=ema9s[ema9s.length-2],pe21=ema21s[ema21s.length-2];
+      if(ce9>ce21&&pe9<=pe21)       score('EMA 9/21',16,'bull','Golden ✕','Golden cross just formed — strong bullish');
+      else if(ce9<ce21&&pe9>=pe21)  score('EMA 9/21',16,'bear','Death ✕','Death cross just formed — strong bearish');
+      else if(ce9>ce21)             score('EMA 9/21',16,'bull',`>${ema21?.toFixed(4)}`,'Fast EMA above slow — bullish trend');
+      else                          score('EMA 9/21',16,'bear',`<${ema21?.toFixed(4)}`,'Fast EMA below slow — bearish trend');
+    }
+
+    // EMA50 trend filter — weight 8
+    if(ema50&&currentPrice){
+      if(currentPrice>ema50*1.001)  score('EMA 50',8,'bull',ema50.toFixed(4),'Price above EMA50 — macro bullish');
+      else if(currentPrice<ema50*0.999) score('EMA 50',8,'bear',ema50.toFixed(4),'Price below EMA50 — macro bearish');
+      else                          score('EMA 50',8,'neu',ema50.toFixed(4),'Price at EMA50 — neutral');
+    }
+
+    // Stochastic — weight 12
+    if(stoch){
+      if(stoch.oversold&&stoch.crossUp)   score('Stochastic',12,'bull',`K:${stoch.k}`,`Oversold crossover ↑ — buy signal`);
+      else if(stoch.overbought&&stoch.crossDown) score('Stochastic',12,'bear',`K:${stoch.k}`,`Overbought crossover ↓ — sell signal`);
+      else if(stoch.oversold)  score('Stochastic',12,'bull',`K:${stoch.k}`,`Oversold zone — potential reversal`);
+      else if(stoch.overbought)score('Stochastic',12,'bear',`K:${stoch.k}`,`Overbought zone — potential reversal`);
+      else                     score('Stochastic',12,'neu',`K:${stoch.k} D:${stoch.d}`,'Mid-range — no signal');
+    }
+
+    // Williams %R — weight 8
+    if(willR!==null){
+      if(willR<-85)      score('Williams %R',8,'bull',willR,'Extreme oversold (<-85)');
+      else if(willR<-70) score('Williams %R',8,'bull',willR,'Oversold (<-70)');
+      else if(willR>-15) score('Williams %R',8,'bear',willR,'Extreme overbought (>-15)');
+      else if(willR>-30) score('Williams %R',8,'bear',willR,'Overbought (>-30)');
+      else               score('Williams %R',8,'neu',willR,'Neutral range');
+    }
+
+    // CCI — weight 8
+    if(cci!==null){
+      if(cci<-150)      score('CCI',8,'bull',cci,'Extreme oversold (<-150)');
+      else if(cci<-100) score('CCI',8,'bull',cci,'Oversold (<-100)');
+      else if(cci>150)  score('CCI',8,'bear',cci,'Extreme overbought (>+150)');
+      else if(cci>100)  score('CCI',8,'bear',cci,'Overbought (>+100)');
+      else              score('CCI',8,'neu',cci,'Neutral');
+    }
+
+    // Momentum — weight 8
+    if(mom!==null){
+      if(mom>0.5)       score('Momentum',8,'bull',`${mom}%`,'Strong upward momentum');
+      else if(mom>0.1)  score('Momentum',8,'bull',`${mom}%`,'Mild upward momentum');
+      else if(mom<-0.5) score('Momentum',8,'bear',`${mom}%`,'Strong downward momentum');
+      else if(mom<-0.1) score('Momentum',8,'bear',`${mom}%`,'Mild downward momentum');
+      else              score('Momentum',8,'neu',`${mom}%`,'No clear momentum');
+    }
+
+    // Trend Strength — weight 10
+    if(trend){
+      if(trend.direction==='uptrend')
+        score('Trend',10,'bull',`${trend.strength}%`,`Uptrend — strength ${trend.strength}%`);
+      else if(trend.direction==='downtrend')
+        score('Trend',10,'bear',`${trend.strength}%`,`Downtrend — strength ${trend.strength}%`);
+      else
+        score('Trend',10,'neu','0%','Sideways — consolidating');
+    }
+
+    // Support / Resistance — weight 10
+    if(sr){
+      if(sr.nearSupport)     score('S/R',10,'bull',sr.support.toFixed(4),'Price at support — bounce expected');
+      else if(sr.nearResistance) score('S/R',10,'bear',sr.resistance.toFixed(4),'Price at resistance — rejection expected');
+      else if(sr.aboveMid)   score('S/R',10,'bull',sr.mid.toFixed(4),'Above midrange — bullish');
+      else                   score('S/R',10,'bear',sr.mid.toFixed(4),'Below midrange — bearish');
+    }
+
+    // Digit Frequency (synthetics only) — weight 12
+    if(df){
+      const isSyn=sym.startsWith('1HZ')||sym.startsWith('R_')||sym.startsWith('BOOM')||sym.startsWith('CRASH')||sym.startsWith('JD')||sym==='stpRNG';
+      if(isSyn){
+        const bias=df.strongEvenBias?'EVEN (strong)':df.evenBias?'EVEN':df.strongOddBias?'ODD (strong)':df.oddBias?'ODD':df.overBias?'OVER':df.underBias?'UNDER':'neutral';
+        const hasBias=bias!=='neutral';
+        score('Digit Frequency',12,hasBias?'bull':'neu',
+          `E:${df.evenPct}% O:${df.oddPct}%`,
+          `Digit bias → ${bias.toUpperCase()} | Last: ${df.lastDigit} | Recent even: ${df.evenRun}/10`
+        );
+      }
+    }
+
+    // Candle Patterns — weight 10
+    if(pats.length){
+      const bs=pats.filter(p=>p.bias==='bull').reduce((s,p)=>s+p.strength,0);
+      const brs=pats.filter(p=>p.bias==='bear').reduce((s,p)=>s+p.strength,0);
+      const bias=bs>brs?'bull':brs>bs?'bear':'neu';
+      score('Candle Pattern',10,bias,pats[0].name,pats.map(p=>p.name).join(' + '));
+    }
+
+    // ── Final computation ─────────────────────────────────
+    const dominant=bullPts>bearPts;
+    const raw=totalWt>0?(dominant?bullPts:bearPts)/totalWt*100:50;
+    let confidence=clamp(parseFloat(raw.toFixed(1)),50,97);
+    const direction=bullPts>bearPts?'BUY':bullPts<bearPts?'SELL':'NEUTRAL';
+
+    // ── Market favourability gate ─────────────────────────
+    const favCheck=_isMarketFavourable({rsi,macd,bb,stoch,atr,trend,sr});
+    if(!favCheck.ok){
+      // Reduce confidence significantly when market is not favourable
+      confidence=Math.max(50,confidence*0.6);
+    }
+
+    // ── Multi-timeframe confirmation ──────────────────────
+    const mtfOk=_multiTimeframeOk(prices,direction);
+    if(!mtfOk)confidence=Math.max(50,confidence*0.75);
+
+    const strength=confidence>=85?'STRONG':confidence>=72?'MODERATE':'WEAK';
+    const signalLabel=strength==='STRONG'?`STRONG ${direction}`:strength==='MODERATE'?direction:'NEUTRAL';
+
+    // ── Profit projection ─────────────────────────────────
+    // Estimate if trade is likely profitable based on momentum + trend alignment
+    const trendAligned=(direction==='BUY'&&trend?.direction==='uptrend')||(direction==='SELL'&&trend?.direction==='downtrend');
+    const macdAligned=macd&&((direction==='BUY'&&macd.bullish)||(direction==='SELL'&&!macd.bullish));
+    const projectedProfit=trendAligned&&macdAligned?'HIGH':trendAligned||macdAligned?'MEDIUM':'LOW';
+
+    return{
+      sym,currentPrice,direction,confidence,strength,signalLabel,
+      favourable:favCheck.ok,
+      favourableReason:favCheck.reason,
+      projectedProfit,
+      trendAligned,mtfOk,
+      indicators:{rsi,rsi7,macd,bb,stoch,atr,willR,cci,ema9,ema21,ema50,mom,trend,sr,df},
+      signals,patterns:pats,
+      bullScore:parseFloat(bullPts.toFixed(1)),
+      bearScore:parseFloat(bearPts.toFixed(1)),
+      timestamp:Date.now(),
+    };
   }
 
-  function _mock(sym){
-    const r=30+Math.random()*40,c=58+Math.random()*30,d=r<45?'BUY':r>55?'SELL':'NEUTRAL';
-    const str=c>82?'STRONG':c>70?'MODERATE':'WEAK';
-    return{sym,currentPrice:0,direction:d,confidence:parseFloat(c.toFixed(1)),strength:str,signalLabel:str==='STRONG'?`STRONG ${d}`:d,
-      indicators:{rsi:parseFloat(r.toFixed(2)),dFreq:{evenPct:50,oddPct:50,overPct:50,underPct:50,lastDigit:Math.floor(Math.random()*10),evenBias:false,oddBias:false}},
-      signals:[{name:'RSI (14)',value:parseFloat(r.toFixed(2)),bias:r<45?'bull':'bear',detail:`RSI: ${parseFloat(r.toFixed(2))}`}],
-      patterns:[],bullScore:d==='BUY'?c:100-c,bearScore:d==='SELL'?c:100-c,timestamp:Date.now()};
+  // Mock fallback when no data
+  function _mock(sym,reason=''){
+    console.warn('[AE] Using mock for',sym,reason);
+    const r=40+Math.random()*20;
+    const c=55+Math.random()*15; // deliberately low confidence on mock
+    const d='NEUTRAL';
+    return{
+      sym,currentPrice:0,direction:d,confidence:parseFloat(c.toFixed(1)),
+      strength:'WEAK',signalLabel:'NEUTRAL',
+      favourable:false,favourableReason:'No live data available',
+      projectedProfit:'LOW',trendAligned:false,mtfOk:false,
+      indicators:{rsi:parseFloat(r.toFixed(2)),df:{evenPct:50,oddPct:50,lastDigit:0}},
+      signals:[{name:'Status',value:'No data',bias:'neu',detail:`Mock data — ${reason}`}],
+      patterns:[],bullScore:50,bearScore:50,
+      timestamp:Date.now(),
+    };
   }
 
-  async function quick(sym){try{return await analyse(sym);}catch{return _mock(sym);}}
-  return{analyse,quick};
+  async function quick(sym){
+    try{return await analyse(sym);}
+    catch(e){return _mock(sym,e.message);}
+  }
+
+  // Pre-load live feeds for common symbols on startup
+  function warmup(){
+    const syms=['1HZ50V','1HZ75V','BOOM500','CRASH500','frxEURUSD','1HZ25V'];
+    syms.forEach(s=>_ensureLiveFeed(s));
+  }
+
+  return{analyse,quick,warmup,_cache,_ensureLiveFeed};
 })();
 
 // ══════════════════════════════════════════════════════════
 // TRADER
 // ══════════════════════════════════════════════════════════
 const Trader = (() => {
-  async function executeTrade(params,source='manual'){
+async function executeTrade(params,source='manual'){
     if(!S.connected)throw new Error('Not connected');
     if(S.activeTrades>=CFG.MAX_ACTIVE)throw new Error('Max active trades reached');
+
+    // ── Pre-trade analysis gate ───────────────────────────
+    // Only skip gate for manual trades explicitly initiated by user
+    if(source!=='MANUAL'&&source!=='manual'){
+      const analysis=await AE.quick(params.symbol).catch(()=>null);
+      if(analysis){
+        // Block trade if market not favourable
+        if(!analysis.favourable){
+          console.log(`[Trader] Blocked — ${analysis.favourableReason}`);
+          throw new Error(analysis.favourableReason);
+        }
+        // Block if projected profit is LOW and confidence below 75
+        if(analysis.projectedProfit==='LOW'&&analysis.confidence<75){
+          console.log('[Trader] Blocked — low profit projection + low confidence');
+          throw new Error('Signal not strong enough — waiting for better entry');
+        }
+        // Block if multi-timeframe not aligned
+        if(!analysis.mtfOk&&analysis.confidence<80){
+          console.log('[Trader] Blocked — timeframes not aligned');
+          throw new Error('Timeframes not aligned — skipping');
+        }
+        // Update confidence in params for simulation weighting
+        params._conf=analysis.confidence;
+      }
+    }
+
+    // ── Execute via real API ──────────────────────────────
     let proposal;
-    try{proposal=await API.getProposal(params);}
-    catch(e){return _sim(params,source);}
+    try{
+      proposal=await API.getProposal(params);
+    }catch(e){
+      console.warn('[Trader] Proposal failed, using simulation:',e.message);
+      return _sim(params,source);
+    }
+
+    // Validate proposal payout is worth it (must be positive expected value)
+    if(proposal&&proposal.payout){
+      const expectedPayout=parseFloat(proposal.payout);
+      const stake=parseFloat(params.stake);
+      if(expectedPayout<stake*0.5){
+        throw new Error(`Poor payout ratio: $${expectedPayout} on $${stake} stake`);
+      }
+    }
+
     let buy;
-    try{buy=await API.buyContract(proposal.id,proposal.ask_price);}
-    catch(e){return _sim(params,source);}
+    try{
+      buy=await API.buyContract(proposal.id,proposal.ask_price);
+    }catch(e){
+      console.warn('[Trader] Buy failed, using simulation:',e.message);
+      return _sim(params,source);
+    }
+
     S.activeTrades++;
-    const entry={id:buy.contract_id,contractType:params.contractType,symbol:params.symbol,stake:parseFloat(buy.buy_price),payout:parseFloat(buy.payout),status:'open',source,openTime:Date.now(),pnl:null,won:null};
-    S.openContracts[buy.contract_id]=entry;S.tradeHistory.unshift(entry);
+    const entry={
+      id:buy.contract_id,
+      contractType:params.contractType,
+      symbol:params.symbol,
+      stake:parseFloat(buy.buy_price),
+      payout:parseFloat(buy.payout),
+      status:'open',source,
+      openTime:Date.now(),pnl:null,won:null,
+    };
+    S.openContracts[buy.contract_id]=entry;
+    S.tradeHistory.unshift(entry);
     UI.updateMetrics();FeedUI.addRow(entry,true);
     return new Promise(res=>{entry._resolve=res;});
   }
-
   function onContractUpdate(c){
     const entry=S.openContracts[c.contract_id];if(!entry)return;
     if(c.is_sold||c.status==='sold'){
@@ -1259,18 +1665,75 @@ const Trader = (() => {
     S.autoTimer=setTimeout(tick,3000+Math.random()*4000);
   }
 
-  async function _autoTrade(){
-    const syms=['1HZ50V','1HZ75V','BOOM500','frxEURUSD','1HZ25V','CRASH500'];
-    const sym=syms[Math.floor(Math.random()*syms.length)];
+async function _autoTrade(){
+    const syms=['1HZ50V','1HZ75V','1HZ25V','BOOM500','CRASH500','frxEURUSD'];
     const thresh=parseInt($('cfgConf')?.value||'72');
-    let a;try{a=await AE.quick(sym);}catch{return;}
-    if(a.confidence<thresh)return;
-    const ct=a.direction==='BUY'?'CALL':'PUT';
     const stake=parseFloat($('cfgStake')?.value||'1');
+
+    // Analyse ALL symbols, pick the BEST signal
+    const analyses=await Promise.all(syms.map(s=>AE.quick(s).catch(()=>null)));
+    const valid=analyses
+      .filter(a=>a&&a.confidence>=thresh&&a.favourable&&a.direction!=='NEUTRAL')
+      .sort((a,b)=>{
+        // Sort by: projected profit weight + confidence
+        const profScore=p=>p==='HIGH'?3:p==='MEDIUM'?2:1;
+        const aScore=profScore(a.projectedProfit)*10+a.confidence;
+        const bScore=profScore(b.projectedProfit)*10+b.confidence;
+        return bScore-aScore;
+      });
+
+    if(!valid.length){
+      console.log('[AutoTrade] No favourable signals found across all markets');
+      return;
+    }
+
+    // Take top signal
+    const best=valid[0];
+    const sym=best.sym;
+
+    // Determine contract type from direction
+    let ct=best.direction==='BUY'?'CALL':'PUT';
+
+    // For synthetics use digits if digit frequency bias is strong
+    const isSyn=sym.startsWith('1HZ')||sym.startsWith('R_')||sym==='stpRNG';
+    if(isSyn&&best.indicators.df){
+      const df=best.indicators.df;
+      if(df.strongEvenBias)ct='DIGITEVEN';
+      else if(df.strongOddBias)ct='DIGITODD';
+      else if(df.overBias)ct='DIGITOVER';
+      else if(df.underBias)ct='DIGITUNDER';
+    }
+
+    // Duration: ticks for synthetics, minutes for forex/crypto
+    const isFx=sym.startsWith('frx')||sym.startsWith('cry')||sym.startsWith('OTC');
+    const dur=isFx?5:5;
+    const durU=isFx?'m':'t';
+
+    const barrier=ct==='DIGITOVER'?4:ct==='DIGITUNDER'?5:null;
+
+    console.log(`[AutoTrade] Best signal: ${sym} ${ct} | Conf:${best.confidence}% | Proj:${best.projectedProfit}`);
+    UI.toast(
+      `🔍 Signal: ${SYMS[sym]||sym}`,
+      `${ct} @ ${best.confidence}% — ${best.signalLabel} | Profit projection: ${best.projectedProfit}`,
+      'info'
+    );
+
     try{
-      const r=await executeTrade({symbol:sym,contractType:ct,stake,duration:5,durationUnit:'t',barrier:null,_conf:a.confidence},'AUTO');
-      UI.toast(r.won?`✅ Auto WIN +$${r.pnl?.toFixed(2)}`:`❌ Auto LOSS -$${stake}`,`${SYMS[sym]||sym} — ${ct} (${a.confidence}%)`,r.won?'success':'error');
-    }catch(e){console.warn('[AutoTrade]',e.message);}
+      const r=await executeTrade({
+        symbol:sym,contractType:ct,stake,
+        duration:dur,durationUnit:durU,
+        barrier,growthRate:null,
+        _conf:best.confidence,
+      },'AUTO');
+      if(r.won){
+        UI.toast(`✅ AUTO WIN +$${r.pnl?.toFixed(2)}`,`${SYMS[sym]||sym} — ${ct}`,'success');
+      } else {
+        UI.toast(`❌ AUTO LOSS -$${stake}`,`${SYMS[sym]||sym} — ${ct}`,'error');
+      }
+    }catch(e){
+      console.warn('[AutoTrade] Blocked or failed:',e.message);
+      UI.toast('⏭ Trade Skipped',e.message,'info');
+    }
   }
 
   function _getRule(){
@@ -1896,6 +2359,12 @@ window.addEventListener('DOMContentLoaded',()=>{
     document.querySelectorAll('.btog').forEach(el=>el.classList.toggle('on',S.autoTrade));
     const l=$('atLbl');if(l)l.textContent=S.autoTrade?'🟢 ON':'OFF';
   },1000);
+  // After connection: warm up live data feeds
+  const _origConn=API.connect.bind?API.connect:null;
+  document.addEventListener('nexus:connected',()=>{
+    AE.warmup();
+    console.log('[AE] Live data feeds warming up...');
+  });
   console.log('[NEXUS TRADE] v2.0 Ready ✓');
 });
 </script>
