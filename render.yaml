@@ -1,0 +1,85 @@
+# ================================================================
+# NEXUS TRADE — Render Deployment Configuration
+# ================================================================
+# Deploy this entire folder to Render as a Web Service
+# Render will read this file automatically.
+#
+# HOW TO DEPLOY:
+# 1. Push this folder to GitHub
+# 2. Go to https://dashboard.render.com → New → Web Service
+# 3. Connect your GitHub repo
+# 4. Render auto-detects this render.yaml
+# 5. Add the SECRET environment variables in the Render dashboard
+#    (anything marked sync: false must be added manually)
+# ================================================================
+
+services:
+  - type: web
+    name: nexus-trade
+    env: node
+    region: oregon           # Change to: oregon, frankfurt, singapore, ohio
+    plan: free               # free | starter | standard | pro
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true         # Auto-deploy on every git push
+
+    # ── Environment Variables ────────────────────────────────
+    # sync: true  = safe to store in render.yaml (non-sensitive)
+    # sync: false = MUST be added manually in Render dashboard (sensitive)
+    envVars:
+
+      # ── SERVER ──────────────────────────────────────────────
+      - key: NODE_ENV
+        value: production
+
+      - key: PORT
+        value: 3000            # Render overrides this automatically
+
+      - key: APP_NAME
+        value: NEXUS TRADE
+
+      - key: APP_ENV
+        value: production
+
+      # ── DERIV API ───────────────────────────────────────────
+      # Get your App ID at: https://developers.deriv.com
+      # The default 1089 is a shared demo app — register your own for production
+      - key: DERIV_APP_ID
+        value: "1089"          # ← REPLACE with your own Deriv App ID
+
+      - key: DERIV_WS_URL
+        value: wss://ws.derivws.com/websockets/v3
+
+      - key: DERIV_OAUTH_URL
+        value: https://oauth.deriv.com/oauth2/authorize
+
+      # ── TRADING DEFAULTS ────────────────────────────────────
+      - key: DEFAULT_STAKE
+        value: "1.00"
+
+      - key: DEFAULT_DURATION
+        value: "5"
+
+      - key: DEFAULT_DURATION_UNIT
+        value: m               # t=ticks, s=seconds, m=minutes, h=hours, d=days
+
+      - key: MIN_CONFIDENCE_AUTO
+        value: "72"            # Auto-trade only when AI confidence >= this %
+
+      - key: MAX_ACTIVE_TRADES
+        value: "5"             # Max simultaneous open trades
+
+      # ── RISK MANAGEMENT DEFAULTS ────────────────────────────
+      - key: DEFAULT_DAILY_TP
+        value: "50"            # Stop trading when daily profit hits this ($)
+
+      - key: DEFAULT_DAILY_SL
+        value: "20"            # Stop trading when daily loss hits this ($)
+
+      - key: MAX_STAKE_PER_TRADE
+        value: "50"            # Hard cap on stake per single trade ($)
+
+      - key: ALLOWED_ACCOUNT_TYPES
+        value: "demo,real"     # Comma-separated: demo | real | demo,real
