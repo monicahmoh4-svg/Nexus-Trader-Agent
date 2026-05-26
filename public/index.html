@@ -764,13 +764,19 @@ const API = (() => {
   ];
   let wsEndpointIdx=0;
 
-  function connect(t,type='demo'){
-    token=(t||'').replace(/[\s'"]/g,'').replace(/[^\x20-\x7E]/g,'').trim();
-    S.accountType=type; reconnAttempts=0; wsEndpointIdx=0;
+function connect(t,type='demo'){
+    // Clean token
+    token=(t||'').replace(/[\s\r\n'"]/g,'').replace(/[^\x20-\x7E]/g,'').trim();
+    // IMPORTANT: always store the account type the user selected
+    S.accountType=type;
+    S.connected=false;
+    reconnAttempts=0;
+    wsEndpointIdx=0;
     if(!token||token.length<10){
-      UI.toast('Invalid Token','Token appears invalid. Get it from app.deriv.com → Account Settings → API Token.','error');
+      UI.toast('Invalid Token','Token appears invalid. Get it from app.deriv.com → API Token','error');
       return;
     }
+    console.log('[API] Connecting — type:',type,'token[:8]:',token.substring(0,8)+'...');
     _open();
   }
   function _open(){
@@ -821,24 +827,63 @@ ws.onopen=()=>{
             UI.toast('Auth Failed',hint,'error');
             UI.setStatus('disconnected'); return;
           }
-          const a=r.authorize;
-          S.balance=parseFloat(a.balance)||0; S.currency=a.currency||'USD';
-          S.loginid=a.loginid||''; S.connected=true;
-          UI.setStatus('connected'); UI.updateBal();
+      const a=r.authorize;
+
+          // ── Detect real vs demo from the account list ────
+          // Deriv returns account_list — use it to confirm type
+          const accountList=a.account_list||[];
+          const isVirtual=a.is_virtual===1||a.is_virtual===true;
+          // Override S.accountType based on actual account data
+          S.accountType=isVirtual?'demo':'real';
+          S.balance=parseFloat(a.balance)||0;
+          S.currency=a.currency||'USD';
+          S.loginid=a.loginid||'';
+          S.email=a.email||'';
+          S.connected=true;
+          S.activeTrades=0;
+
+          console.log('[API] Authorized:',S.loginid,'type:',S.accountType,'balance:',S.balance,S.currency);
+
+          UI.setStatus('connected');
+          UI.updateBal();
+
+          // Subscribe to real-time balance updates
           _send({balance:1,subscribe:1});
+
+          // Subscribe to transaction stream for live P&L
           _send({transaction:1,subscribe:1});
+
+          // Load open contracts
           _send({portfolio:1},(pr)=>{
-            if(!pr.error)(pr.portfolio.contracts||[]).forEach(c=>{
-              _send({proposal_open_contract:1,contract_id:c.contract_id,subscribe:1});
-              S.activeTrades++;
-            });
+            if(!pr.error){
+              const contracts=pr.portfolio.contracts||[];
+              contracts.forEach(c=>{
+                _send({proposal_open_contract:1,contract_id:c.contract_id,subscribe:1});
+                S.activeTrades++;
+              });
+            }
             UI.updateMetrics();
           });
+
+          // Start live ticker
           Ticker.start();
+
+          // Init dashboard charts
           Dashboard.init();
-UI.toast('Connected ✓',`${S.accountType.toUpperCase()} — ${a.loginid} | ${a.currency} ${parseFloat(a.balance).toFixed(2)}`,'success');
-          // Warm up live data feeds immediately after auth
-          setTimeout(()=>AE.warmup(),500);
+
+          UI.toast(
+            `✅ Connected — ${S.accountType.toUpperCase()}`,
+            `${S.loginid} | ${S.currency} ${S.balance.toFixed(2)}`,
+            'success'
+          );
+
+          // Warm up live data feeds immediately
+          setTimeout(()=>{ if(typeof AE!=='undefined')AE.warmup(); },500);
+
+          // Update settings page if visible
+          const sAT=$('sAT'); if(sAT)sAT.textContent=S.accountType.toUpperCase();
+          const sLID=$('sLID'); if(sLID)sLID.textContent=S.loginid;
+          const sBal=$('sBal'); if(sBal)sBal.textContent=`${S.currency} ${S.balance.toFixed(2)}`;
         });
       },300);
     };
@@ -907,15 +952,33 @@ function _schedReconn(){
     if(t==='proposal_open_contract'&&msg.proposal_open_contract){
       Trader.onContractUpdate(msg.proposal_open_contract);
     }
-    if(t==='balance'){S.balance=parseFloat(msg.balance.balance);UI.updateBal();}
+if(t==='balance'){
+      const newBal=parseFloat(msg.balance.balance);
+      console.log('[API] Balance update:',newBal,msg.balance.currency);
+      S.balance=newBal;
+      S.currency=msg.balance.currency||S.currency||'USD';
+      UI.updateBal();
+      UI.updateMetrics();
+    }
     if(t==='transaction'){
       const tx=msg.transaction;
-      if(tx.action==='buy'){S.activeTrades++;UI.updateMetrics();}
+      console.log('[API] Transaction:',tx.action,'amount:',tx.amount,'balance:',tx.balance);
+      if(tx.action==='buy'){
+        S.activeTrades++;
+        // Update balance immediately from transaction
+        if(tx.balance!==undefined)S.balance=parseFloat(tx.balance);
+        UI.updateMetrics();
+        UI.updateBal();
+      }
       if(tx.action==='sell'){
         S.activeTrades=Math.max(0,S.activeTrades-1);
         const p=parseFloat(tx.amount||0);
-        if(p>=0){S.wins++;S.todayPnl+=p;}else{S.losses++;S.todayPnl+=p;}
+        // Update balance from transaction data
+        if(tx.balance!==undefined)S.balance=parseFloat(tx.balance);
+        if(p>0){S.wins++;S.todayPnl+=p;}
+        else{S.losses++;S.todayPnl+=Math.abs(p)*-1;}
         UI.updateMetrics();
+        UI.updateBal();
       }
     }
   }
@@ -1637,16 +1700,52 @@ async function executeTrade(params,source='manual'){
   }
   function _ms(d,u){const v=parseInt(d)||5;return{t:3500,s:v*1000,m:v*60000,h:v*3600000,d:v*86400000}[u]||5000;}
 
-  function toggleAuto(){
-    if(!S.connected){Auth.show();return;}
+ function toggleAuto(){
+    if(!S.connected){
+      UI.toast('Not Connected','Please connect your Deriv account first','error');
+      Auth.show();
+      return;
+    }
     S.autoTrade=!S.autoTrade;
+    console.log('[Trader] Auto-trade toggled:',S.autoTrade);
+
+    // Sync all toggle buttons across every page
     document.querySelectorAll('.btog').forEach(el=>el.classList.toggle('on',S.autoTrade));
-    $('atLbl').textContent=S.autoTrade?'ON':'OFF';
-    const ban=$('autoBan');if(ban)ban.classList.toggle('on',S.autoTrade);
-    const ls=$('autoLs');if(ls)ls.textContent=S.autoTrade?'🟢 AUTO-TRADING ACTIVE — AI is scanning markets and executing trades':'Enable AI to automatically execute trades when confidence exceeds threshold';
-    const cl=$('cmdAtLbl');if(cl)cl.textContent=S.autoTrade?'🟢 ON — AI is executing trades automatically':'OFF — Click to enable autonomous trading';
-    if(S.autoTrade){_startLoop();UI.toast('🤖 Auto-Trading ON','AI will execute trades above confidence threshold','success');}
-    else{clearTimeout(S.autoTimer);UI.toast('⏸ Auto-Trading OFF','Manual mode activated','info');}
+
+    // Update sidebar label
+    const atLbl=$('atLbl');
+    if(atLbl)atLbl.textContent=S.autoTrade?'🟢 ON':'OFF';
+
+    // Update dashboard banner
+    const ban=$('autoBan');
+    if(ban)ban.classList.toggle('on',S.autoTrade);
+    const ls=$('autoLs');
+    if(ls)ls.textContent=S.autoTrade
+      ?'🟢 AUTO-TRADING ACTIVE — Scanning markets and executing trades continuously'
+      :'Enable AI to automatically execute trades when market is favourable';
+
+    // Update commands page label
+    const cl=$('cmdAtLbl');
+    if(cl)cl.textContent=S.autoTrade
+      ?'🟢 ON — AI is scanning and trading continuously'
+      :'OFF — Click to enable autonomous trading';
+
+    if(S.autoTrade){
+      // Cancel any previous loop
+      clearTimeout(S.autoTimer);
+      clearInterval(S.autoInterval);
+      UI.toast(
+        '🤖 Autonomous Trading ON',
+        `Scanning ${S.accountType.toUpperCase()} account — executing when market is favourable`,
+        'success'
+      );
+      // Start loop IMMEDIATELY
+      _startLoop();
+    } else {
+      clearTimeout(S.autoTimer);
+      clearInterval(S.autoInterval);
+      UI.toast('⏸ Autonomous Trading OFF','All auto-execution stopped','info');
+    }
   }
 
   function _startLoop(){
@@ -1964,13 +2063,36 @@ const UI = (() => {
       if(btn){btn.textContent='Connect';btn.className='conn-btn';}
     }
   }
-  function updateBal(){
-    const b=$('accBadge'),bl=$('balBadge');
-    if(b){b.textContent=S.accountType==='real'?'💰 REAL':'🧪 DEMO';b.className='acc-badge '+(S.accountType==='real'?'real-m':'demo-m');}
-    if(bl){bl.style.display='block';bl.textContent=`${S.currency||'USD'} ${S.balance.toFixed(2)}`;}
-    const sb=$('sBal');if(sb)sb.textContent=`${S.currency||'USD'} ${S.balance.toFixed(2)}`;
-    const sa=$('sAT');if(sa)sa.textContent=S.accountType.toUpperCase();
+function updateBal(){
+    const isReal=S.accountType==='real';
+    const icon=isReal?'💰':'🧪';
+    const label=isReal?'REAL':'DEMO';
+    const cls=isReal?'real-m':'demo-m';
+    const balStr=`${S.currency||'USD'} ${(S.balance||0).toFixed(2)}`;
+
+    const b=$('accBadge');
+    if(b){b.textContent=`${icon} ${label}`;b.className=`acc-badge ${cls}`;}
+
+    const bl=$('balBadge');
+    if(bl){bl.style.display='block';bl.textContent=balStr;}
+
+    // Metrics balance display
+    const mBal=$('mBal');
+    if(mBal)mBal.textContent=balStr;
+
+    // Settings page
+    const sb=$('sBal');if(sb)sb.textContent=balStr;
+    const sa=$('sAT');if(sa)sa.textContent=`${label} ACCOUNT`;
     const sl=$('sLID');if(sl)sl.textContent=S.loginid||'—';
+
+    // Header account type indicator
+    const stext=$('stext');
+    if(stext&&S.connected){
+      stext.textContent=isReal?'🔴 REAL ACCOUNT LIVE':'🟢 DEMO LIVE';
+      stext.className=`stext ${isReal?'real-live':'live'}`;
+    }
+
+    console.log('[UI] Balance updated:',balStr,'type:',S.accountType);
   }
   function updateMetrics(){
     const s=id=>$(id)&&($(id).textContent=arguments[1]);
@@ -1998,37 +2120,76 @@ const UI = (() => {
 // AUTH
 // ══════════════════════════════════════════════════════════
 const Auth = (() => {
+  // Default to demo — never lock to real
   let _type='demo';
-  function show(){$('authModal').style.display='flex';}
-  function close(){$('authModal').style.display='none';}
+
+  function show(){
+    // Always reset to demo tab when opening modal
+    _type='demo';
+    document.querySelectorAll('.mtab').forEach(x=>x.classList.remove('active'));
+    const demoTab=$('demoTab');
+    if(demoTab)demoTab.classList.add('active');
+    const realTab=$('realTab');
+    if(realTab)realTab.classList.remove('active');
+    const rwarn=$('rwarn');
+    if(rwarn)rwarn.style.display='none';
+    $('authModal').style.display='flex';
+  }
+
+  function close(){
+    $('authModal').style.display='none';
+  }
+
   function switchType(t,el){
     _type=t;
     document.querySelectorAll('.mtab').forEach(x=>x.classList.remove('active'));
-    el.classList.add('active');
-    $('rwarn').style.display=t==='real'?'block':'none';
+    if(el)el.classList.add('active');
+    const rwarn=$('rwarn');
+    if(rwarn)rwarn.style.display=t==='real'?'block':'none';
+    // Update placeholder to guide user
+    const inp=$('tokenIn');
+    if(inp)inp.placeholder=t==='demo'
+      ?'Paste your DEMO account API token here...'
+      :'Paste your REAL account API token here...';
+    console.log('[Auth] Account type switched to:',t);
   }
-function connect(){
+
+  function connect(){
     const raw=$('tokenIn').value||'';
-    const t=raw.replace(/[\s'"]/g,'').replace(/[^\x20-\x7E]/g,'').trim();
-    if(!t){UI.toast('Missing Token','Please paste your Deriv API token','error');return;}
-    if(t.length<10){UI.toast('Invalid Token','That does not look like a valid Deriv token. Please check and try again.','error');return;}
+    const t=raw.replace(/[\s\r\n'"]/g,'').replace(/[^\x20-\x7E]/g,'').trim();
+    if(!t){
+      UI.toast('Missing Token','Please paste your Deriv API token','error');
+      return;
+    }
+    if(t.length<10){
+      UI.toast('Invalid Token','Token too short. Copy it from app.deriv.com → API Token','error');
+      return;
+    }
+    console.log('[Auth] Connecting as',_type,'token length:',t.length);
     close();
     $('tokenIn').value='';
     API.connect(t,_type);
   }
+
   function oauth(){
     const url='https://oauth.deriv.com/oauth2/authorize?app_id=1089&l=EN&brand=deriv';
-    const win=window.open(url,'_blank','width=600,height=700,left=300,top=100');
-    UI.toast('OAuth Opening','Approve access in the Deriv window. Token will auto-fill.','info');
+    const win=window.open(url,'_blank','width=620,height=720,left=200,top=80');
+    UI.toast('OAuth Opening','Approve access in the Deriv window','info');
     const chk=setInterval(()=>{
       try{
         if(win&&win.closed){clearInterval(chk);return;}
-        const p=new URLSearchParams(win.location.search);
-        const tk=p.get('token1')||p.get('token');
-        if(tk){clearInterval(chk);win.close();$('tokenIn').value=tk;connect();}
-      }catch{}
-    },1000);
+        const params=new URLSearchParams(win.location.search);
+        const tk=params.get('token1')||params.get('token');
+        if(tk){
+          clearInterval(chk);
+          win.close();
+          $('tokenIn').value=tk;
+          connect();
+        }
+      }catch(e){/* cross-origin — keep polling */}
+    },800);
   }
+
   return{show,close,switchType,connect,oauth};
 })();
 
