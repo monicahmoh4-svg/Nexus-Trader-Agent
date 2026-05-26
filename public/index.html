@@ -1650,21 +1650,61 @@ async function executeTrade(params,source='manual'){
   }
 
   function _startLoop(){
-    const tick=async()=>{
-      if(!S.autoTrade||!S.connected)return;
-      if(S.activeTrades>=CFG.MAX_ACTIVE){S.autoTimer=setTimeout(tick,8000);return;}
-      // Check daily limits
-      const tp=parseFloat($('cfgTP')?.value||'0'),sl=parseFloat($('cfgSL')?.value||'0');
-      if(tp>0&&S.todayPnl>=tp){toggleAuto();UI.toast('🎯 Take Profit Hit!',`Daily target $${tp} reached`,'success');return;}
-      if(sl>0&&S.todayPnl<=-sl){toggleAuto();UI.toast('🛑 Stop Loss Hit!',`Daily loss -$${sl} reached`,'error');Bots.stopAll();return;}
-      // Check rules
-      const rule=_getRule();
-      if(rule){await _execRule(rule);}else{await _autoTrade();}
-      if(S.autoTrade)S.autoTimer=setTimeout(tick,10000+Math.random()*12000);
-    };
-    S.autoTimer=setTimeout(tick,3000+Math.random()*4000);
-  }
+    // Cancel any existing loop immediately
+    clearTimeout(S.autoTimer);
+    clearInterval(S.autoInterval);
 
+    UI.toast('🔍 Scanning Markets...','Analysing all markets for best entry signal','info');
+
+    const tick=async()=>{
+      // Stop if auto-trade was turned off
+      if(!S.autoTrade||!S.connected){
+        console.log('[AutoLoop] Stopped — autoTrade:',S.autoTrade,'connected:',S.connected);
+        return;
+      }
+
+      // Daily limit checks
+      const tp=parseFloat($('cfgTP')?.value||'0');
+      const sl=parseFloat($('cfgSL')?.value||'0');
+      if(tp>0&&S.todayPnl>=tp){
+        toggleAuto();
+        UI.toast('🎯 Take Profit Hit!',`Daily target $${tp} reached — stopping`,'success');
+        return;
+      }
+      if(sl>0&&S.todayPnl<=-sl){
+        toggleAuto();
+        Bots.stopAll();
+        UI.toast('🛑 Stop Loss Hit!',`Daily loss -$${sl} reached — stopping all`,'error');
+        return;
+      }
+
+      // If max active trades reached, wait and retry quickly
+      if(S.activeTrades>=CFG.MAX_ACTIVE){
+        console.log('[AutoLoop] Max active trades reached, waiting...');
+        S.autoTimer=setTimeout(tick,4000);
+        return;
+      }
+
+      // Check manual rules first
+      const rule=_getRule();
+      if(rule){
+        await _execRule(rule).catch(e=>console.warn('[Rule]',e.message));
+      } else {
+        await _autoTrade().catch(e=>console.warn('[AutoTrade]',e.message));
+      }
+
+      // Schedule next iteration immediately — no long wait
+      // Use short interval so we catch signals fast
+      if(S.autoTrade){
+        // Wait for any open trade to settle first, then scan again
+        const waitMs=S.activeTrades>0?3000:2000;
+        S.autoTimer=setTimeout(tick,waitMs);
+      }
+    };
+
+    // Start IMMEDIATELY — no delay
+    tick();
+  }
 async function _autoTrade(){
     const syms=['1HZ50V','1HZ75V','1HZ25V','BOOM500','CRASH500','frxEURUSD'];
     const thresh=parseInt($('cfgConf')?.value||'72');
