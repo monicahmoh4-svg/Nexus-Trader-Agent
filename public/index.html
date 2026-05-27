@@ -299,23 +299,57 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
   <div class="mbox">
     <button class="mcls" onclick="Auth.close()">&#215;</button>
     <div class="mtit">NEXUS TRADE</div>
-    <div class="msub">Autonomous Trading Intelligence &mdash; Real-time Deriv WebSocket API</div>
+    <div class="msub">Autonomous Trading Intelligence &mdash; Powered by Deriv</div>
+
     <div class="mtabs">
       <div class="mtab active" id="demoTab" onclick="Auth.switchType('demo',this)">&#129514; Demo Account</div>
       <div class="mtab" id="realTab" onclick="Auth.switchType('real',this)">&#128176; Real Account</div>
     </div>
-    <div id="rwarn" class="rwarn" style="display:none">&#9888;&#65039; <strong>Real Money Warning:</strong> All trades use real funds. Understand risks fully before connecting.</div>
-    <input class="minput" id="tokenIn" type="password" placeholder="Paste Deriv API Token here..."/>
-    <div style="font-size:11px;color:var(--text3);margin-bottom:13px;line-height:1.6">
-      Get token: <a href="https://app.deriv.com/account/api-token" target="_blank" style="color:var(--accent)">app.deriv.com &#8594; API Token</a> &mdash; enable <strong>Read</strong> + <strong>Trade</strong> permissions.
+
+    <div id="rwarn" class="rwarn" style="display:none">
+      &#9888;&#65039; <strong>Real Money Warning:</strong> All trades use real funds.
     </div>
-    <button class="mbtn" onclick="Auth.connect()">Connect Account &#8594;</button>
+
+    <!-- Step indicator -->
+    <div style="background:var(--bg3);border-radius:8px;padding:12px 14px;margin-bottom:12px;font-size:12px;color:var(--text2);line-height:1.7">
+      <div id="authStepLabel" style="font-weight:600;color:var(--accent);margin-bottom:4px">&#128274; How to get your token:</div>
+      <div id="authStepDemo" style="">
+        1. Go to <a href="https://app.deriv.com/account/api-token" target="_blank" style="color:var(--accent)">app.deriv.com/account/api-token</a><br/>
+        2. Make sure you are logged into your <strong>Demo</strong> account<br/>
+        3. Create a token — enable <strong>Read</strong> + <strong>Trade</strong><br/>
+        4. Copy and paste it below
+      </div>
+      <div id="authStepReal" style="display:none">
+        1. Go to <a href="https://app.deriv.com/account/api-token" target="_blank" style="color:var(--accent)">app.deriv.com/account/api-token</a><br/>
+        2. Make sure you are logged into your <strong>Real</strong> account<br/>
+        3. Create a token — enable <strong>Read</strong> + <strong>Trade</strong><br/>
+        4. Copy and paste it below
+      </div>
+    </div>
+
+    <input class="minput" id="tokenIn" type="text"
+      placeholder="Paste your Demo API token here..."
+      autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"/>
+
+    <div style="font-size:11px;color:var(--text3);margin-bottom:13px">
+      &#128161; Each account (Demo &amp; Real) has its own separate API token.
+    </div>
+
+    <button class="mbtn" id="connectBtn2" onclick="Auth.connect()">
+      &#9889; Connect Demo Account
+    </button>
+
     <div class="mdiv">&mdash; or &mdash;</div>
-    <button class="oabtn" onclick="Auth.oauth()">&#128272; Connect via Deriv OAuth (Recommended)</button>
-    <div style="font-size:10px;color:var(--text3);margin-top:13px;text-align:center;line-height:1.6">&#128274; Token stored in browser session only. All communication direct to Deriv's official API.</div>
+
+    <button class="oabtn" onclick="Auth.oauth()">
+      &#128272; Connect via Deriv OAuth
+    </button>
+
+    <div style="font-size:10px;color:var(--text3);margin-top:13px;text-align:center;line-height:1.6">
+      &#128274; Token stored in browser memory only. Never sent to any server.
+    </div>
   </div>
 </div>
-
 <!-- HEADER -->
 <header class="hdr">
   <div class="logo">NEXUS<span>TRADE</span></div>
@@ -757,35 +791,56 @@ const API = (() => {
   let ws=null, token=null, reqId=1, pingInt=null, reconnTimer=null, reconnAttempts=0;
   const pending={}, tickSubs={}, tickPrices={};
 // All WS endpoints to try in order
-  const WS_ENDPOINTS=[
+// Deriv WebSocket endpoints — tried in order
+  const WS_ENDPOINTS = [
     'wss://ws.derivws.com/websockets/v3?app_id=1089',
     'wss://ws.binaryws.com/websockets/v3?app_id=1089',
     'wss://frontend.binaryws.com/websockets/v3?app_id=1089',
   ];
-  let wsEndpointIdx=0;
+  let wsEndpointIdx = 0;
 
-function connect(t,type='demo'){
-    token=(t||'').replace(/[\s\r\n'"]/g,'').replace(/[^\x20-\x7E]/g,'').trim();
-    S.accountType=type;
-    S.connected=false;
-    S.balance=0;
-    S.currency='USD';
-    reconnAttempts=0;
-    wsEndpointIdx=0;
-    if(!token||token.length<10){
-      UI.toast('Invalid Token','Token appears invalid. Get it from app.deriv.com → API Token','error');
+  // Build endpoint URL — app_id stays 1089 (works for both demo and real tokens)
+  function _endpointUrl() {
+    const base = WS_ENDPOINTS[wsEndpointIdx % WS_ENDPOINTS.length];
+    return base; // token determines demo vs real, NOT the URL
+  }
+function connect(t, type='demo') {
+    // Sanitize
+    token = (t || '')
+      .replace(/\s+/g, '')
+      .replace(/['"]/g, '')
+      .replace(/[^\x21-\x7E]/g, '')
+      .trim();
+
+    if (!token || token.length < 8) {
+      UI.toast('Invalid Token', 'Please get a valid token from app.deriv.com → API Token', 'error');
       return;
     }
-    console.log('[API] Connecting — type:',type,'token[:8]:',token.substring(0,8)+'...');
+
+    // Store selected account type
+    S.accountType = type;
+    S.connected   = false;
+    S.balance     = 0;
+    S.currency    = 'USD';
+    S.loginid     = '';
+    S.wins        = 0;
+    S.losses      = 0;
+    S.todayPnl    = 0;
+    S.activeTrades= 0;
+    reconnAttempts = 0;
+    wsEndpointIdx  = 0;
+
+    console.log('[API] connect() called — type:', type, 'token[0:8]:', token.substring(0,8));
+    UI.setStatus('connecting');
     _open();
   }
   function _open(){
     if(ws){try{ws.onopen=null;ws.onmessage=null;ws.onerror=null;ws.onclose=null;ws.close();}catch(e){}}
     ws=null;
     UI.setStatus('connecting');
-    const endpoint=WS_ENDPOINTS[wsEndpointIdx%WS_ENDPOINTS.length];
-    console.log('[WS] Connecting to',endpoint);
-    try{ ws=new WebSocket(endpoint); }
+   const endpoint = _endpointUrl();
+    console.log('[WS] Connecting to:', endpoint, '| account type:', S.accountType);
+    try { ws = new WebSocket(endpoint); }
     catch(e){
       console.error('[WS] Failed to create WebSocket:',e);
       // Try next endpoint
@@ -2173,77 +2228,102 @@ function updateBal(){
 // AUTH
 // ══════════════════════════════════════════════════════════
 const Auth = (() => {
-  // Default to demo — never lock to real
-  let _type='demo';
+  let _type = 'demo';
 
-  function show(){
-    // Always reset to demo tab when opening modal
-    _type='demo';
-    document.querySelectorAll('.mtab').forEach(x=>x.classList.remove('active'));
-    const demoTab=$('demoTab');
-    if(demoTab)demoTab.classList.add('active');
-    const realTab=$('realTab');
-    if(realTab)realTab.classList.remove('active');
-    const rwarn=$('rwarn');
-    if(rwarn)rwarn.style.display='none';
-    $('authModal').style.display='flex';
+  function show() {
+    // Reset to demo every time modal opens
+    _setType('demo');
+    $('authModal').style.display = 'flex';
+    $('tokenIn').value = '';
+    $('tokenIn').focus();
   }
 
-  function close(){
-    $('authModal').style.display='none';
+  function close() {
+    $('authModal').style.display = 'none';
   }
 
-  function switchType(t,el){
-    _type=t;
-    document.querySelectorAll('.mtab').forEach(x=>x.classList.remove('active'));
-    if(el)el.classList.add('active');
-    const rwarn=$('rwarn');
-    if(rwarn)rwarn.style.display=t==='real'?'block':'none';
-    // Update placeholder to guide user
-    const inp=$('tokenIn');
-    if(inp)inp.placeholder=t==='demo'
-      ?'Paste your DEMO account API token here...'
-      :'Paste your REAL account API token here...';
-    console.log('[Auth] Account type switched to:',t);
+  function _setType(t) {
+    _type = t;
+    // Update tabs
+    const dTab = $('demoTab'), rTab = $('realTab');
+    if (dTab) dTab.className = 'mtab' + (t === 'demo' ? ' active' : '');
+    if (rTab) rTab.className = 'mtab' + (t === 'real' ? ' active' : '');
+    // Show/hide warning
+    const rw = $('rwarn');
+    if (rw) rw.style.display = t === 'real' ? 'block' : 'none';
+    // Update instructions
+    const sd = $('authStepDemo'), sr = $('authStepReal');
+    if (sd) sd.style.display = t === 'demo' ? 'block' : 'none';
+    if (sr) sr.style.display = t === 'real' ? 'block' : 'none';
+    // Update button text and placeholder
+    const btn = $('connectBtn2');
+    if (btn) btn.textContent = t === 'demo'
+      ? '⚡ Connect Demo Account'
+      : '⚡ Connect Real Account';
+    const inp = $('tokenIn');
+    if (inp) inp.placeholder = t === 'demo'
+      ? 'Paste your DEMO account API token here...'
+      : 'Paste your REAL account API token here...';
+    // Update step label
+    const lbl = $('authStepLabel');
+    if (lbl) lbl.innerHTML = `🔑 How to get your ${t.toUpperCase()} token:`;
   }
 
-  function connect(){
-    const raw=$('tokenIn').value||'';
-    const t=raw.replace(/[\s\r\n'"]/g,'').replace(/[^\x20-\x7E]/g,'').trim();
-    if(!t){
-      UI.toast('Missing Token','Please paste your Deriv API token','error');
+  function switchType(t, el) {
+    _setType(t);
+    $('tokenIn').value = '';
+    $('tokenIn').focus();
+  }
+
+  function connect() {
+    const raw = ($('tokenIn').value || '');
+    // Aggressive clean — remove all whitespace, quotes, invisible chars
+    const t = raw
+      .replace(/\s+/g, '')
+      .replace(/['"]/g, '')
+      .replace(/[^\x21-\x7E]/g, '')
+      .trim();
+
+    if (!t) {
+      UI.toast('No Token', 'Please paste your API token in the box', 'error');
+      $('tokenIn').focus();
       return;
     }
-    if(t.length<10){
-      UI.toast('Invalid Token','Token too short. Copy it from app.deriv.com → API Token','error');
+    if (t.length < 8) {
+      UI.toast('Token Too Short', 'This does not look like a valid token. Copy it directly from Deriv.', 'error');
       return;
     }
-    console.log('[Auth] Connecting as',_type,'token length:',t.length);
+
+    console.log('[Auth] Connecting as:', _type, '| token length:', t.length, '| first 6:', t.substring(0, 6));
     close();
-    $('tokenIn').value='';
-    API.connect(t,_type);
+    // Small delay so modal closes before WS noise
+    setTimeout(() => API.connect(t, _type), 100);
   }
 
-  function oauth(){
-    const url='https://oauth.deriv.com/oauth2/authorize?app_id=1089&l=EN&brand=deriv';
-    const win=window.open(url,'_blank','width=620,height=720,left=200,top=80');
-    UI.toast('OAuth Opening','Approve access in the Deriv window','info');
-    const chk=setInterval(()=>{
-      try{
-        if(win&&win.closed){clearInterval(chk);return;}
-        const params=new URLSearchParams(win.location.search);
-        const tk=params.get('token1')||params.get('token');
-        if(tk){
-          clearInterval(chk);
-          win.close();
-          $('tokenIn').value=tk;
-          connect();
+  function oauth() {
+    const url = 'https://oauth.deriv.com/oauth2/authorize?app_id=1089&l=EN&brand=deriv';
+    const win = window.open(url, '_blank', 'width=640,height=720,left=200,top=80');
+    UI.toast('Opening Deriv OAuth', 'Approve access in the popup window', 'info');
+    const chk = setInterval(() => {
+      try {
+        if (win && win.closed) { clearInterval(chk); return; }
+        const href = win.location.href || '';
+        // OAuth redirects back with token in URL
+        if (href.includes('token') || href.includes('deriv')) {
+          const params = new URLSearchParams(win.location.search);
+          const tk = params.get('token1') || params.get('token') || params.get('acct1');
+          if (tk) {
+            clearInterval(chk);
+            win.close();
+            $('tokenIn').value = tk;
+            connect();
+          }
         }
-      }catch(e){/* cross-origin — keep polling */}
-    },800);
+      } catch (e) { /* cross-origin — keep polling */ }
+    }, 600);
   }
 
-  return{show,close,switchType,connect,oauth};
+  return { show, close, switchType, connect, oauth };
 })();
 
 // ══════════════════════════════════════════════════════════
