@@ -765,11 +765,11 @@ const API = (() => {
   let wsEndpointIdx=0;
 
 function connect(t,type='demo'){
-    // Clean token
     token=(t||'').replace(/[\s\r\n'"]/g,'').replace(/[^\x20-\x7E]/g,'').trim();
-    // IMPORTANT: always store the account type the user selected
     S.accountType=type;
     S.connected=false;
+    S.balance=0;
+    S.currency='USD';
     reconnAttempts=0;
     wsEndpointIdx=0;
     if(!token||token.length<10){
@@ -827,33 +827,65 @@ ws.onopen=()=>{
             UI.toast('Auth Failed',hint,'error');
             UI.setStatus('disconnected'); return;
           }
-      const a=r.authorize;
+  const a=r.authorize;
+          console.log('[API] Raw authorize response:',JSON.stringify(a));
 
-          // ── Detect real vs demo from the account list ────
-          // Deriv returns account_list — use it to confirm type
-          const accountList=a.account_list||[];
-          const isVirtual=a.is_virtual===1||a.is_virtual===true;
-          // Override S.accountType based on actual account data
+          // ── Account type detection ───────────────────────
+          // is_virtual=1 means demo, is_virtual=0 means real
+          const isVirtual=a.is_virtual===1||a.is_virtual==='1'||a.is_virtual===true;
           S.accountType=isVirtual?'demo':'real';
-          S.balance=parseFloat(a.balance)||0;
+
+          // ── Balance — parse carefully ────────────────────
+          // Deriv sends balance as string or number
+          const rawBal=a.balance;
+          S.balance=rawBal!==undefined&&rawBal!==null
+            ?parseFloat(String(rawBal).replace(/,/g,''))
+            :0;
+
+          // ── Currency ────────────────────────────────────
           S.currency=a.currency||'USD';
+
+          // ── Account info ────────────────────────────────
           S.loginid=a.loginid||'';
           S.email=a.email||'';
+          S.fullname=a.fullname||'';
           S.connected=true;
           S.activeTrades=0;
+          S.wins=0;
+          S.losses=0;
+          S.todayPnl=0;
 
-          console.log('[API] Authorized:',S.loginid,'type:',S.accountType,'balance:',S.balance,S.currency);
+          console.log('[API] Authorized successfully:');
+          console.log('  LoginID:',S.loginid);
+          console.log('  Type:',S.accountType,'(is_virtual:',a.is_virtual,')');
+          console.log('  Balance:',S.balance,S.currency);
 
+          // ── Update UI immediately ────────────────────────
           UI.setStatus('connected');
           UI.updateBal();
+          UI.updateMetrics();
 
-          // Subscribe to real-time balance updates
-          _send({balance:1,subscribe:1});
+          // ── Subscribe to live balance stream ─────────────
+          _send({balance:1,subscribe:1},(balResp)=>{
+            if(!balResp.error&&balResp.balance){
+              const liveBal=parseFloat(String(balResp.balance.balance).replace(/,/g,''));
+              console.log('[API] Live balance confirmed:',liveBal,balResp.balance.currency);
+              S.balance=liveBal;
+              S.currency=balResp.balance.currency||S.currency;
+              UI.updateBal();
+              UI.updateMetrics();
+            }
+          });
 
-          // Subscribe to transaction stream for live P&L
+          // ── Subscribe to transaction stream ──────────────
           _send({transaction:1,subscribe:1});
 
-          // Load open contracts
+          // ── Get account summary for extra balance check ──
+          _send({get_account_status:1},(gs)=>{
+            if(!gs.error)console.log('[API] Account status:',gs.get_account_status?.status);
+          });
+
+          // ── Load any open contracts ──────────────────────
           _send({portfolio:1},(pr)=>{
             if(!pr.error){
               const contracts=pr.portfolio.contracts||[];
@@ -865,25 +897,46 @@ ws.onopen=()=>{
             UI.updateMetrics();
           });
 
-          // Start live ticker
-          Ticker.start();
+          // ── Also request fresh balance directly ──────────
+          _send({balance:1},(br)=>{
+            if(!br.error&&br.balance){
+              const freshBal=parseFloat(String(br.balance.balance).replace(/,/g,''));
+              console.log('[API] Fresh balance fetch:',freshBal,br.balance.currency);
+              S.balance=freshBal;
+              S.currency=br.balance.currency||S.currency;
+              UI.updateBal();
+              UI.updateMetrics();
+            }
+          });
 
-          // Init dashboard charts
+          // ── Start ticker and dashboard ───────────────────
+          Ticker.start();
           Dashboard.init();
 
+          // ── Show connection toast ────────────────────────
           UI.toast(
-            `✅ Connected — ${S.accountType.toUpperCase()}`,
-            `${S.loginid} | ${S.currency} ${S.balance.toFixed(2)}`,
-            'success'
+            `✅ ${S.accountType.toUpperCase()} Account Connected`,
+            `${S.loginid} | Balance: ${S.currency} ${S.balance.toFixed(2)}`,
+            'success',6000
           );
 
-          // Warm up live data feeds immediately
-          setTimeout(()=>{ if(typeof AE!=='undefined')AE.warmup(); },500);
+          // ── Warm up AI data feeds ─────────────────────────
+          setTimeout(()=>{
+            if(typeof AE!=='undefined'&&AE.warmup)AE.warmup();
+          },800);
 
-          // Update settings page if visible
-          const sAT=$('sAT'); if(sAT)sAT.textContent=S.accountType.toUpperCase();
-          const sLID=$('sLID'); if(sLID)sLID.textContent=S.loginid;
-          const sBal=$('sBal'); if(sBal)sBal.textContent=`${S.currency} ${S.balance.toFixed(2)}`;
+          // ── Force full UI refresh after 1 second ─────────
+          // Ensures all dashboard elements show correct values
+          setTimeout(()=>{
+            UI.updateBal();
+            UI.updateMetrics();
+            const mAccType=$('mAccType');
+            if(mAccType)mAccType.textContent=S.accountType.toUpperCase()+' ACCOUNT';
+            const sAT=$('sAT');if(sAT)sAT.textContent=S.accountType.toUpperCase()+' ACCOUNT';
+            const sLID=$('sLID');if(sLID)sLID.textContent=S.loginid;
+            const sBal=$('sBal');if(sBal)sBal.textContent=`${S.currency} ${S.balance.toFixed(2)}`;
+            console.log('[UI] Full refresh done — balance:',S.balance,S.currency);
+          },1500);
         });
       },300);
     };
