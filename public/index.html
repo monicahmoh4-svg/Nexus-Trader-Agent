@@ -1186,517 +1186,494 @@ const Ticker = (() => {
 // ANALYSIS ENGINE
 // ══════════════════════════════════════════════════════════
 const AE = (() => {
-  const avg=a=>a.length?a.reduce((s,v)=>s+v,0)/a.length:0;
-  const std=a=>{const m=avg(a);return Math.sqrt(avg(a.map(x=>(x-m)**2)));};
-  const last=a=>a[a.length-1];
-  const clamp=(v,mn,mx)=>Math.min(mx,Math.max(mn,v));
+  const avg = a => a.length ? a.reduce((s,v) => s+v, 0)/a.length : 0;
+  const std = a => { const m=avg(a); return Math.sqrt(avg(a.map(x=>(x-m)**2))); };
+  const last = a => a[a.length-1];
+  const clamp = (v,mn,mx) => Math.min(mx, Math.max(mn,v));
 
-  // ── Tick cache: stores real data per symbol ──────────────
-  const _cache={};
-  const _subs={};
+  // ── Live data cache per symbol ─────────────────────────
+  const _cache = {};
+  const _subbed = {};
 
-  // Subscribe to live ticks and accumulate into cache
-  function _ensureLiveFeed(sym){
-    if(_subs[sym])return;
-    _subs[sym]=true;
-    if(!_cache[sym])_cache[sym]={prices:[],times:[],candles:[]};
-    API.subTick(sym,({price,epoch})=>{
-      const c=_cache[sym];
-      c.prices.push(price);
-      c.times.push(epoch||Date.now()/1000);
-      if(c.prices.length>500)c.prices.shift();
-      if(c.times.length>500)c.times.shift();
+  // All markets to scan
+  const ALL_SCAN_SYMS = [
+    // Synthetics — Volatility
+    '1HZ10V','1HZ25V','1HZ50V','1HZ75V','1HZ100V',
+    'R_10','R_25','R_50','R_75','R_100',
+    // Synthetics — Boom & Crash
+    'BOOM300N','BOOM500','BOOM1000',
+    'CRASH300N','CRASH500','CRASH1000',
+    // Synthetics — Jump & Step
+    'JD10','JD25','JD50','JD75','JD100','stpRNG',
+    // Forex
+    'frxEURUSD','frxGBPUSD','frxUSDJPY','frxAUDUSD',
+    'frxUSDCAD','frxNZDUSD','frxEURGBP','frxEURJPY','frxGBPJPY',
+    // Commodities
+    'frxXAUUSD','frxXAGUSD','frxXPDUSD','frxXPTUSD',
+    // Indices
+    'OTC_DJI','OTC_SP500','OTC_NDX','OTC_FTSE','OTC_GDAXI','OTC_N225',
+  ];
+
+  // ── Subscribe live ticks and buffer ──────────────────
+  function _subTick(sym) {
+    if (_subbed[sym]) return;
+    _subbed[sym] = true;
+    if (!_cache[sym]) _cache[sym] = { prices:[], times:[], candles:[] };
+    API.subTick(sym, ({price, epoch}) => {
+      const c = _cache[sym];
+      c.prices.push(parseFloat(price));
+      c.times.push(epoch || Math.floor(Date.now()/1000));
+      if (c.prices.length > 600) { c.prices.shift(); c.times.shift(); }
     });
   }
 
-  // Load tick history from Deriv then keep live feed running
-  async function _loadHistory(sym){
-    _ensureLiveFeed(sym);
-    if(!_cache[sym])_cache[sym]={prices:[],times:[],candles:[]};
-    // Only fetch if we have less than 50 ticks cached
-    if(_cache[sym].prices.length>=50)return _cache[sym];
-    try{
-      const [th,ch]=await Promise.all([
-        API.getTickHist(sym,300),
-        API.getCandleHist(sym,60,100),
+  // ── Load full history from Deriv then keep live feed ──
+  async function _ensureData(sym) {
+    _subTick(sym);
+    if (!_cache[sym]) _cache[sym] = { prices:[], times:[], candles:[] };
+    const c = _cache[sym];
+    // Only re-fetch if we have fewer than 80 prices
+    if (c.prices.length >= 80 && c.candles.length >= 20) return c;
+    try {
+      const [th, ch] = await Promise.all([
+        API.getTickHist(sym, 350),
+        API.getCandleHist(sym, 60, 120),
       ]);
-      // Merge: history first, then any live ticks already buffered
-      const existing=_cache[sym].prices;
-      _cache[sym].prices=[...th.prices,...existing].slice(-400);
-      _cache[sym].times=[...th.times,..._cache[sym].times].slice(-400);
-      _cache[sym].candles=ch;
-    }catch(e){
-      console.warn('[AE] history fetch failed for',sym,e.message||e);
+      // Merge history + any live ticks already in buffer
+      const live = c.prices.slice(-20);
+      c.prices = [...th.prices.map(Number), ...live].slice(-500);
+      c.times  = [...th.times.map(Number)].slice(-500);
+      c.candles = ch || [];
+    } catch(e) {
+      console.warn('[AE] fetch failed:', sym, e.message||e);
     }
-    return _cache[sym];
+    return c;
   }
 
-  // ── Indicators ───────────────────────────────────────────
-  function _rsi(prices,p=14){
-    if(prices.length<p+2)return null;
-    const ch=prices.slice(1).map((x,i)=>x-prices[i]);
-    let ag=avg(ch.slice(0,p).map(c=>c>0?c:0));
-    let al=avg(ch.slice(0,p).map(c=>c<0?-c:0));
-    for(let i=p;i<ch.length;i++){
-      ag=(ag*(p-1)+(ch[i]>0?ch[i]:0))/p;
-      al=(al*(p-1)+(ch[i]<0?-ch[i]:0))/p;
+  // ── Technical indicators ──────────────────────────────
+
+  function _rsi(p, period=14) {
+    if (p.length < period+2) return null;
+    const ch = p.slice(1).map((x,i) => x - p[i]);
+    let ag = avg(ch.slice(0,period).map(c => c>0?c:0));
+    let al = avg(ch.slice(0,period).map(c => c<0?-c:0));
+    for (let i=period; i<ch.length; i++) {
+      ag = (ag*(period-1) + (ch[i]>0?ch[i]:0)) / period;
+      al = (al*(period-1) + (ch[i]<0?-ch[i]:0)) / period;
     }
-    return al===0?100:parseFloat((100-100/(1+ag/al)).toFixed(2));
+    return al===0 ? 100 : parseFloat((100 - 100/(1+ag/al)).toFixed(2));
   }
 
-  function _emaSeries(prices,p){
-    if(prices.length<p)return[];
-    const k=2/(p+1);const s=[];
-    let e=avg(prices.slice(0,p));s.push(e);
-    for(let i=p;i<prices.length;i++){e=prices[i]*k+e*(1-k);s.push(e);}
+  function _emaSeries(p, n) {
+    if (p.length < n) return [];
+    const k = 2/(n+1);
+    let e = avg(p.slice(0,n));
+    const s = [e];
+    for (let i=n; i<p.length; i++) { e = p[i]*k + e*(1-k); s.push(e); }
     return s;
   }
-  function _ema(prices,p){const s=_emaSeries(prices,p);return s.length?last(s):null;}
+  function _ema(p, n) { const s=_emaSeries(p,n); return s.length ? last(s) : null; }
 
-  function _macd(prices){
-    if(prices.length<35)return null;
-    const f=_emaSeries(prices,12),s=_emaSeries(prices,26);
-    const len=Math.min(f.length,s.length);
-    const ml=Array.from({length:len},(_,i)=>f[f.length-len+i]-s[s.length-len+i]);
-    if(ml.length<9)return null;
-    const sig=_emaSeries(ml,9);
-    const h=last(ml)-last(sig);
-    const ph=ml[ml.length-2]-(sig[sig.length-2]||last(sig));
-    return{
-      macd:last(ml),signal:last(sig),
-      histogram:parseFloat(h.toFixed(7)),
-      prevHistogram:ph,
-      crossUp:h>0&&ph<=0,
-      crossDown:h<0&&ph>=0,
-      bullish:h>0,
+  function _macd(p) {
+    if (p.length < 40) return null;
+    const f = _emaSeries(p,12), s = _emaSeries(p,26);
+    const len = Math.min(f.length, s.length);
+    const ml = Array.from({length:len}, (_,i) => f[f.length-len+i] - s[s.length-len+i]);
+    if (ml.length < 9) return null;
+    const sig = _emaSeries(ml, 9);
+    const h = last(ml) - last(sig);
+    const ph = (ml[ml.length-2]||0) - (sig[sig.length-2]||last(sig));
+    return {
+      macd: last(ml), signal: last(sig),
+      histogram: h, prevHistogram: ph,
+      crossUp: h>0 && ph<=0,
+      crossDown: h<0 && ph>=0,
+      bullish: h > 0,
     };
   }
 
-  function _bb(prices,p=20,mult=2){
-    if(prices.length<p)return null;
-    const sl=prices.slice(-p),mid=avg(sl),sd=std(sl);
-    const up=mid+mult*sd,lo=mid-mult*sd,cur=last(prices);
-    const pctB=(cur-lo)/(up-lo||1);
-    const bw=(up-lo)/mid;
-    return{
-      upper:up,middle:mid,lower:lo,
-      pctB:parseFloat(pctB.toFixed(4)),
-      bandwidth:parseFloat(bw.toFixed(6)),
-      aboveUpper:cur>up,belowLower:cur<lo,
-      nearUpper:pctB>0.8,nearLower:pctB<0.2,
-      squeeze:bw<0.005,expansion:bw>0.02,
+  function _bb(p, n=20, mult=2) {
+    if (p.length < n) return null;
+    const sl = p.slice(-n), m = avg(sl), sd = std(sl)||0.0001;
+    const up = m+mult*sd, lo = m-mult*sd, cur = last(p);
+    const pctB = (cur-lo)/(up-lo||0.0001);
+    return {
+      upper:up, middle:m, lower:lo,
+      pctB: parseFloat(pctB.toFixed(4)),
+      bandwidth: (up-lo)/m,
+      aboveUpper: cur>up, belowLower: cur<lo,
+      nearUpper: pctB>0.8, nearLower: pctB<0.2,
+      squeeze: (up-lo)/m < 0.005,
     };
   }
 
-  function _stoch(prices,kp=14,dp=3){
-    if(prices.length<kp+dp+2)return null;
-    const kv=[];
-    for(let i=kp-1;i<prices.length;i++){
-      const sl=prices.slice(i-kp+1,i+1);
-      const hi=Math.max(...sl),lo=Math.min(...sl);
-      kv.push(hi===lo?50:(prices[i]-lo)/(hi-lo)*100);
+  function _stoch(p, kp=14, dp=3) {
+    if (p.length < kp+dp+2) return null;
+    const kv = [];
+    for (let i=kp-1; i<p.length; i++) {
+      const sl=p.slice(i-kp+1,i+1);
+      const hi=Math.max(...sl), lo=Math.min(...sl);
+      kv.push(hi===lo ? 50 : (p[i]-lo)/(hi-lo)*100);
     }
-    const dv=[];
-    for(let i=dp-1;i<kv.length;i++)dv.push(avg(kv.slice(i-dp+1,i+1)));
-    const k=last(kv),d=last(dv);
-    const pk=kv[kv.length-2]??k,pd=dv[dv.length-2]??d;
-    return{
-      k:parseFloat(k.toFixed(2)),d:parseFloat(d.toFixed(2)),
-      crossUp:k>d&&pk<=pd,crossDown:k<d&&pk>=pd,
-      overbought:k>80,oversold:k<20,
+    const dv = [];
+    for (let i=dp-1; i<kv.length; i++) dv.push(avg(kv.slice(i-dp+1,i+1)));
+    const k=last(kv), d=last(dv), pk=kv[kv.length-2]??k, pd=dv[dv.length-2]??d;
+    return { k:parseFloat(k.toFixed(2)), d:parseFloat(d.toFixed(2)),
+      crossUp:k>d&&pk<=pd, crossDown:k<d&&pk>=pd,
+      overbought:k>80, oversold:k<20 };
+  }
+
+  function _atr(p, n=14) {
+    if (p.length < n+2) return null;
+    const tr = p.slice(1).map((x,i) => Math.abs(x-p[i]));
+    return avg(tr.slice(-n));
+  }
+
+  function _willR(p, n=14) {
+    if (p.length < n) return null;
+    const sl=p.slice(-n), hi=Math.max(...sl), lo=Math.min(...sl);
+    return hi===lo ? -50 : parseFloat(((hi-last(p))/(hi-lo)*-100).toFixed(2));
+  }
+
+  function _cci(p, n=20) {
+    if (p.length < n) return null;
+    const sl=p.slice(-n), tp=avg(sl);
+    const md = avg(sl.map(x=>Math.abs(x-tp)))||0.0001;
+    return parseFloat(((last(p)-tp)/(0.015*md)).toFixed(2));
+  }
+
+  function _momentum(p, n=10) {
+    if (p.length < n+1) return null;
+    const prev = p[p.length-1-n];
+    return parseFloat(((last(p)-prev)/prev*100).toFixed(4));
+  }
+
+  function _trend(p, n=20) {
+    if (p.length < n*2) return { strength:0, direction:'sideways' };
+    const r=avg(p.slice(-n)), e=avg(p.slice(-n*2,-n));
+    const pct=(r-e)/e*100;
+    return {
+      strength: clamp(Math.abs(pct)*15, 0, 100),
+      direction: pct>0.04?'uptrend':pct<-0.04?'downtrend':'sideways',
+      pct,
     };
   }
 
-  function _atr(prices,p=14){
-    if(prices.length<p+2)return null;
-    const tr=prices.slice(1).map((x,i)=>Math.abs(x-prices[i]));
-    return parseFloat(avg(tr.slice(-p)).toFixed(6));
-  }
-
-  function _willR(prices,p=14){
-    if(prices.length<p)return null;
-    const sl=prices.slice(-p),hi=Math.max(...sl),lo=Math.min(...sl);
-    return hi===lo?-50:parseFloat(((hi-last(prices))/(hi-lo)*-100).toFixed(2));
-  }
-
-  function _cci(prices,p=20){
-    if(prices.length<p)return null;
-    const sl=prices.slice(-p),tp=avg(sl);
-    const md=avg(sl.map(x=>Math.abs(x-tp)))||0.0001;
-    return parseFloat(((last(prices)-tp)/(0.015*md)).toFixed(2));
-  }
-
-  function _momentum(prices,p=10){
-    if(prices.length<p+1)return null;
-    return parseFloat(((last(prices)-prices[prices.length-1-p])/prices[prices.length-1-p]*100).toFixed(4));
-  }
-
-  function _trendStrength(prices,p=20){
-    if(prices.length<p*2)return{strength:0,direction:'sideways'};
-    const recent=avg(prices.slice(-p));
-    const prior=avg(prices.slice(-p*2,-p));
-    const pct=(recent-prior)/prior*100;
-    const str=clamp(Math.abs(pct)*12,0,100);
-    return{
-      strength:parseFloat(str.toFixed(1)),
-      direction:pct>0.05?'uptrend':pct<-0.05?'downtrend':'sideways',
-      pct:parseFloat(pct.toFixed(5)),
+  function _sr(p, lb=80) {
+    if (p.length < 10) return null;
+    const sl=p.slice(-lb);
+    const hi=Math.max(...sl), lo=Math.min(...sl), mid=(hi+lo)/2, cur=last(p);
+    return {
+      resistance:hi, support:lo, mid,
+      nearResistance: cur >= hi*0.9985,
+      nearSupport: cur <= lo*1.0015,
+      aboveMid: cur > mid,
     };
   }
 
-  function _sr(prices,lb=80){
-    if(prices.length<10)return null;
-    const sl=prices.slice(-lb);
-    const hi=Math.max(...sl),lo=Math.min(...sl),mid=(hi+lo)/2;
-    const cur=last(prices);
-    return{
-      resistance:hi,support:lo,mid,
-      nearResistance:cur>hi*0.998,
-      nearSupport:cur<lo*1.002,
-      aboveMid:cur>mid,
-    };
-  }
-
-  function _digitFreq(prices,lb=150){
-    if(prices.length<20)return null;
-    const digits=prices.slice(-lb).map(p=>{
-      const s=p.toFixed(2).replace('.','');
+  function _digitFreq(p, lb=200) {
+    if (p.length < 30) return null;
+    const digits = p.slice(-lb).map(x => {
+      const s = x.toFixed(2).replace('.','');
       return parseInt(s[s.length-1]);
     });
-    const freq=Array(10).fill(0);
-    digits.forEach(d=>freq[d]++);
-    const tot=digits.length;
-    const ep=[0,2,4,6,8].reduce((s,d)=>s+freq[d],0)/tot*100;
-    const op=[1,3,5,7,9].reduce((s,d)=>s+freq[d],0)/tot*100;
-    const ovp=digits.filter(d=>d>5).length/tot*100;
-    const unp=digits.filter(d=>d<5).length/tot*100;
-    // Last 10 digits to detect run patterns
-    const last10=digits.slice(-10);
-    const evenRun=last10.filter(d=>d%2===0).length;
-    const oddRun=last10.filter(d=>d%2!==0).length;
-    return{
-      freq,
-      lastDigit:last(digits),
-      evenPct:parseFloat(ep.toFixed(1)),
-      oddPct:parseFloat(op.toFixed(1)),
-      overPct:parseFloat(ovp.toFixed(1)),
+    const freq = Array(10).fill(0);
+    digits.forEach(d => freq[d]++);
+    const tot = digits.length;
+    const ep = [0,2,4,6,8].reduce((s,d)=>s+freq[d],0)/tot*100;
+    const op = [1,3,5,7,9].reduce((s,d)=>s+freq[d],0)/tot*100;
+    const ovp = digits.filter(d=>d>5).length/tot*100;
+    const unp = digits.filter(d=>d<5).length/tot*100;
+    const last20 = digits.slice(-20);
+    const eLast = last20.filter(d=>d%2===0).length;
+    const oLast = last20.filter(d=>d%2!==0).length;
+    return {
+      lastDigit: last(digits),
+      evenPct: parseFloat(ep.toFixed(1)),
+      oddPct:  parseFloat(op.toFixed(1)),
+      overPct: parseFloat(ovp.toFixed(1)),
       underPct:parseFloat(unp.toFixed(1)),
-      evenBias:ep>56,oddBias:op>56,
-      overBias:ovp>57,underBias:unp>57,
-      strongEvenBias:ep>62,strongOddBias:op>62,
-      evenRun,oddRun,
-      recentEvenBias:evenRun>7,
-      recentOddBias:oddRun>7,
+      evenBias: ep>55, oddBias: op>55,
+      strongEvenBias: ep>62, strongOddBias: op>62,
+      overBias: ovp>57, underBias: unp>57,
+      recentEvenBias: eLast>=14,
+      recentOddBias:  oLast>=14,
     };
   }
 
-  function _candlePatterns(candles){
-    if(!candles||candles.length<3)return[];
-    const ps=[];
-    const c=candles.slice(-5);
-    const body=x=>Math.abs((x.close||0)-(x.open||0));
-    const bull=x=>(x.close||0)>(x.open||0);
-    const bear=x=>(x.close||0)<(x.open||0);
-    const [c1,c2,c3]=c.slice(-3);
-    if(!c1||!c2||!c3)return[];
-    // Doji
-    const range=c3.high-c3.low||0.0001;
-    if(body(c3)<range*0.08)ps.push({name:'Doji',bias:'neutral',strength:1});
-    // Hammer
-    const ls=Math.min(c3.open,c3.close)-c3.low;
-    if(ls>body(c3)*2.5&&bear(c2))ps.push({name:'Hammer',bias:'bull',strength:2});
-    // Shooting Star
-    const us=c3.high-Math.max(c3.open,c3.close);
-    if(us>body(c3)*2.5&&bull(c2))ps.push({name:'Shooting Star',bias:'bear',strength:2});
-    // Engulfing
-    if(bear(c2)&&bull(c3)&&body(c3)>body(c2)*1.1)ps.push({name:'Bullish Engulf',bias:'bull',strength:3});
-    if(bull(c2)&&bear(c3)&&body(c3)>body(c2)*1.1)ps.push({name:'Bearish Engulf',bias:'bear',strength:3});
-    // Three soldiers/crows
-    if(bull(c1)&&bull(c2)&&bull(c3))ps.push({name:'Three Soldiers',bias:'bull',strength:3});
-    if(bear(c1)&&bear(c2)&&bear(c3))ps.push({name:'Three Crows',bias:'bear',strength:3});
-    // Piercing / Dark Cloud
-    if(bear(c2)&&bull(c3)&&c3.close>(c2.open+c2.close)/2)ps.push({name:'Piercing Line',bias:'bull',strength:2});
-    if(bull(c2)&&bear(c3)&&c3.close<(c2.open+c2.close)/2)ps.push({name:'Dark Cloud',bias:'bear',strength:2});
+  function _candlePatterns(candles) {
+    if (!candles || candles.length < 3) return [];
+    const ps = [];
+    const [c1,c2,c3] = candles.slice(-3);
+    if (!c1||!c2||!c3) return [];
+    const body = x => Math.abs((x.close||0)-(x.open||0));
+    const bull = x => (x.close||0) > (x.open||0);
+    const bear = x => (x.close||0) < (x.open||0);
+    const rng  = c3.high - c3.low || 0.0001;
+    if (body(c3) < rng*0.08) ps.push({name:'Doji',bias:'neutral',w:1});
+    const ls = Math.min(c3.open,c3.close)-c3.low;
+    if (ls>body(c3)*2.5&&bear(c2)) ps.push({name:'Hammer',bias:'bull',w:2});
+    const us = c3.high-Math.max(c3.open,c3.close);
+    if (us>body(c3)*2.5&&bull(c2)) ps.push({name:'Shooting Star',bias:'bear',w:2});
+    if (bear(c2)&&bull(c3)&&body(c3)>body(c2)*1.05) ps.push({name:'Bullish Engulf',bias:'bull',w:3});
+    if (bull(c2)&&bear(c3)&&body(c3)>body(c2)*1.05) ps.push({name:'Bearish Engulf',bias:'bear',w:3});
+    if (bull(c1)&&bull(c2)&&bull(c3)) ps.push({name:'Three Soldiers',bias:'bull',w:3});
+    if (bear(c1)&&bear(c2)&&bear(c3)) ps.push({name:'Three Crows',bias:'bear',w:3});
     return ps;
   }
 
-  // ── Market Condition Filter ───────────────────────────────
-  // Returns true if market conditions are suitable to trade
-  function _isMarketFavourable(ind){
-    const {rsi,macd,bb,stoch,atr,trend,sr}=ind;
-    // Reject if volatility too high (price whipsawing)
-    if(atr&&bb&&atr>bb.bandwidth*8)return{ok:false,reason:'Extreme volatility — skipping'};
-    // Reject if all indicators flat/neutral
-    let neutralCount=0;
-    if(rsi&&rsi>42&&rsi<58)neutralCount++;
-    if(macd&&Math.abs(macd.histogram)<0.00001)neutralCount++;
-    if(stoch&&stoch.k>40&&stoch.k<60)neutralCount++;
-    if(neutralCount>=3)return{ok:false,reason:'Market too flat — no clear direction'};
-    // Reject sideways with no momentum
-    if(trend&&trend.direction==='sideways'&&trend.strength<5)
-      return{ok:false,reason:'Sideways consolidation — waiting for breakout'};
-    return{ok:true,reason:'Market conditions favourable'};
-  }
+  // ── Weighted confidence scoring ───────────────────────
+  function _score(indicators, candles, prices) {
+    const {rsi,rsi7,macd,bb,stoch,willR,cci,mom,trend,sr,df,ema9s,ema21s,ema50,atr} = indicators;
+    let bull=0, bear=0, total=0;
+    const signals = [];
 
-  // ── Multi-timeframe confirmation ──────────────────────────
-  // Checks if short-term trend matches medium-term trend
-  function _multiTimeframeOk(prices,direction){
-    if(prices.length<60)return true; // not enough data, allow
-    const shortTrend=_trendStrength(prices.slice(-20),10);
-    const medTrend=_trendStrength(prices.slice(-60),30);
-    if(direction==='BUY'){
-      // Both timeframes should lean bullish or at least not strongly bearish
-      if(medTrend.direction==='downtrend'&&medTrend.strength>60)return false;
-    } else if(direction==='SELL'){
-      if(medTrend.direction==='uptrend'&&medTrend.strength>60)return false;
-    }
-    return true;
-  }
-
-  // ── Master composite analysis ─────────────────────────────
-  async function analyse(sym){
-    let data;
-    try{ data=await _loadHistory(sym); }
-    catch(e){ return _mock(sym,'fetch error'); }
-
-    const prices=data.prices;
-    const candles=data.candles||[];
-
-    if(prices.length<30)return _mock(sym,'insufficient data');
-
-    // Compute all indicators on real live data
-    const rsi=_rsi(prices,14);
-    const rsi7=_rsi(prices,7);
-    const macd=_macd(prices);
-    const bb=_bb(prices,20,2);
-    const stoch=_stoch(prices,14,3);
-    const atr=_atr(prices,14);
-    const willR=_willR(prices,14);
-    const cci=_cci(prices,20);
-    const ema9=_ema(prices,9);
-    const ema21=_ema(prices,21);
-    const ema50=_ema(prices,50);
-    const ema9s=_emaSeries(prices,9);
-    const ema21s=_emaSeries(prices,21);
-    const mom=_momentum(prices,10);
-    const trend=_trendStrength(prices,20);
-    const sr=_sr(prices,80);
-    const df=_digitFreq(prices,150);
-    const pats=_candlePatterns(candles);
-    const currentPrice=last(prices);
-
-    // ── Weighted scoring ──────────────────────────────────
-    let bullPts=0,bearPts=0,totalWt=0;
-    const signals=[];
-
-    function score(name,wt,bias,value,detail){
-      totalWt+=wt;
-      if(bias==='bull')bullPts+=wt;
-      else if(bias==='bear')bearPts+=wt;
-      else{bullPts+=wt*0.5;bearPts+=wt*0.5;}
-      signals.push({name,value,bias,detail});
+    function add(name, weight, bias, value, detail) {
+      total += weight;
+      if (bias==='bull') bull += weight;
+      else if (bias==='bear') bear += weight;
+      else { bull += weight*0.5; bear += weight*0.5; }
+      signals.push({name, value, bias, detail});
     }
 
-    // RSI — weight 18
-    if(rsi!==null){
-      if(rsi<25)       score('RSI (14)',18,'bull',rsi,`Strongly oversold (${rsi}) — reversal imminent`);
-      else if(rsi<35)  score('RSI (14)',18,'bull',rsi,`Oversold (${rsi}) — bounce likely`);
-      else if(rsi>75)  score('RSI (14)',18,'bear',rsi,`Strongly overbought (${rsi}) — reversal imminent`);
-      else if(rsi>65)  score('RSI (14)',18,'bear',rsi,`Overbought (${rsi}) — pullback likely`);
-      else if(rsi<48)  score('RSI (14)',18,'bull',rsi*0.6,`Below midline (${rsi}) — mild bullish`);
-      else if(rsi>52)  score('RSI (14)',18,'bear',rsi*0.6,`Above midline (${rsi}) — mild bearish`);
-      else             score('RSI (14)',18,'neu',rsi,`Neutral (${rsi})`);
+    // RSI14 — weight 18
+    if (rsi!==null) {
+      if      (rsi < 25) add('RSI(14)',18,'bull',rsi,`Extreme oversold (${rsi})`);
+      else if (rsi < 35) add('RSI(14)',18,'bull',rsi,`Oversold (${rsi})`);
+      else if (rsi > 75) add('RSI(14)',18,'bear',rsi,`Extreme overbought (${rsi})`);
+      else if (rsi > 65) add('RSI(14)',18,'bear',rsi,`Overbought (${rsi})`);
+      else if (rsi < 47) add('RSI(14)',18,'bull',rsi,`Below midline (${rsi})`);
+      else if (rsi > 53) add('RSI(14)',18,'bear',rsi,`Above midline (${rsi})`);
+      else               add('RSI(14)',18,'neu', rsi,`Neutral (${rsi})`);
     }
 
-    // RSI7 short-term — weight 8
-    if(rsi7!==null){
-      if(rsi7<20)      score('RSI (7)',8,'bull',rsi7,`Extreme oversold short-term (${rsi7})`);
-      else if(rsi7>80) score('RSI (7)',8,'bear',rsi7,`Extreme overbought short-term (${rsi7})`);
-      else if(rsi7<40) score('RSI (7)',8,'bull',rsi7,`Short-term bearish pressure (${rsi7})`);
-      else if(rsi7>60) score('RSI (7)',8,'bear',rsi7,`Short-term bullish pressure (${rsi7})`);
-      else             score('RSI (7)',8,'neu',rsi7,`Neutral short-term (${rsi7})`);
+    // RSI7 short — weight 9
+    if (rsi7!==null) {
+      if      (rsi7 < 20) add('RSI(7)',9,'bull',rsi7,`Extreme oversold (${rsi7})`);
+      else if (rsi7 > 80) add('RSI(7)',9,'bear',rsi7,`Extreme overbought (${rsi7})`);
+      else if (rsi7 < 40) add('RSI(7)',9,'bull',rsi7,`Bearish pressure (${rsi7})`);
+      else if (rsi7 > 60) add('RSI(7)',9,'bear',rsi7,`Bullish pressure (${rsi7})`);
+      else                add('RSI(7)',9,'neu', rsi7,`Neutral (${rsi7})`);
     }
 
     // MACD — weight 20
-    if(macd){
-      if(macd.crossUp)        score('MACD',20,'bull',macd.histogram.toFixed(6),'Bullish crossover ↑ — strong buy');
-      else if(macd.crossDown) score('MACD',20,'bear',macd.histogram.toFixed(6),'Bearish crossover ↓ — strong sell');
-      else if(macd.bullish)   score('MACD',20,'bull',macd.histogram.toFixed(6),'Positive histogram — bullish momentum');
-      else                    score('MACD',20,'bear',macd.histogram.toFixed(6),'Negative histogram — bearish momentum');
+    if (macd) {
+      if      (macd.crossUp)   add('MACD',20,'bull',macd.histogram.toFixed(6),'Bullish crossover ↑');
+      else if (macd.crossDown) add('MACD',20,'bear',macd.histogram.toFixed(6),'Bearish crossover ↓');
+      else if (macd.bullish)   add('MACD',20,'bull',macd.histogram.toFixed(6),'Positive histogram');
+      else                     add('MACD',20,'bear',macd.histogram.toFixed(6),'Negative histogram');
     }
 
     // Bollinger Bands — weight 15
-    if(bb){
-      if(bb.belowLower)      score('Bollinger Bands',15,'bull',`%B ${(bb.pctB*100).toFixed(0)}%`,'Price below lower band — oversold bounce');
-      else if(bb.aboveUpper) score('Bollinger Bands',15,'bear',`%B ${(bb.pctB*100).toFixed(0)}%`,'Price above upper band — overbought');
-      else if(bb.nearLower)  score('Bollinger Bands',15,'bull',`%B ${(bb.pctB*100).toFixed(0)}%`,'Near lower band — bullish setup');
-      else if(bb.nearUpper)  score('Bollinger Bands',15,'bear',`%B ${(bb.pctB*100).toFixed(0)}%`,'Near upper band — bearish setup');
-      else if(bb.squeeze)    score('Bollinger Bands',15,'neu',`BW ${(bb.bandwidth*100).toFixed(2)}%`,'Squeeze — breakout imminent');
-      else                   score('Bollinger Bands',15,'neu',`%B ${(bb.pctB*100).toFixed(0)}%`,'Inside bands — neutral');
+    if (bb) {
+      if      (bb.belowLower)  add('Bollinger',15,'bull',`%B ${(bb.pctB*100).toFixed(0)}%`,'Below lower band — oversold');
+      else if (bb.aboveUpper)  add('Bollinger',15,'bear',`%B ${(bb.pctB*100).toFixed(0)}%`,'Above upper band — overbought');
+      else if (bb.nearLower)   add('Bollinger',15,'bull',`%B ${(bb.pctB*100).toFixed(0)}%`,'Near lower band');
+      else if (bb.nearUpper)   add('Bollinger',15,'bear',`%B ${(bb.pctB*100).toFixed(0)}%`,'Near upper band');
+      else if (bb.squeeze)     add('Bollinger',15,'neu', `BW ${(bb.bandwidth*100).toFixed(2)}%`,'Squeeze — breakout pending');
+      else                     add('Bollinger',15,'neu', `%B ${(bb.pctB*100).toFixed(0)}%`,'Inside bands');
     }
 
-    // EMA Cross — weight 16
-    if(ema9s.length>2&&ema21s.length>2){
-      const ce9=last(ema9s),ce21=last(ema21s);
-      const pe9=ema9s[ema9s.length-2],pe21=ema21s[ema21s.length-2];
-      if(ce9>ce21&&pe9<=pe21)       score('EMA 9/21',16,'bull','Golden ✕','Golden cross just formed — strong bullish');
-      else if(ce9<ce21&&pe9>=pe21)  score('EMA 9/21',16,'bear','Death ✕','Death cross just formed — strong bearish');
-      else if(ce9>ce21)             score('EMA 9/21',16,'bull',`>${ema21?.toFixed(4)}`,'Fast EMA above slow — bullish trend');
-      else                          score('EMA 9/21',16,'bear',`<${ema21?.toFixed(4)}`,'Fast EMA below slow — bearish trend');
+    // EMA Cross 9/21 — weight 16
+    if (ema9s && ema9s.length>2 && ema21s && ema21s.length>2) {
+      const ce9=last(ema9s), ce21=last(ema21s);
+      const pe9=ema9s[ema9s.length-2], pe21=ema21s[ema21s.length-2];
+      if      (ce9>ce21 && pe9<=pe21) add('EMA9/21',16,'bull','Golden ✕','Golden cross — strong bullish');
+      else if (ce9<ce21 && pe9>=pe21) add('EMA9/21',16,'bear','Death ✕','Death cross — strong bearish');
+      else if (ce9>ce21)              add('EMA9/21',16,'bull',`9>${last(ema21s).toFixed(4)}`,'Fast above slow — bullish');
+      else                            add('EMA9/21',16,'bear',`9<${last(ema21s).toFixed(4)}`,'Fast below slow — bearish');
     }
 
-    // EMA50 trend filter — weight 8
-    if(ema50&&currentPrice){
-      if(currentPrice>ema50*1.001)  score('EMA 50',8,'bull',ema50.toFixed(4),'Price above EMA50 — macro bullish');
-      else if(currentPrice<ema50*0.999) score('EMA 50',8,'bear',ema50.toFixed(4),'Price below EMA50 — macro bearish');
-      else                          score('EMA 50',8,'neu',ema50.toFixed(4),'Price at EMA50 — neutral');
+    // EMA50 filter — weight 8
+    if (ema50 && prices.length) {
+      const cur = last(prices);
+      if      (cur > ema50*1.0005) add('EMA50',8,'bull',ema50.toFixed(4),'Above EMA50 — macro bull');
+      else if (cur < ema50*0.9995) add('EMA50',8,'bear',ema50.toFixed(4),'Below EMA50 — macro bear');
+      else                         add('EMA50',8,'neu', ema50.toFixed(4),'At EMA50');
     }
 
     // Stochastic — weight 12
-    if(stoch){
-      if(stoch.oversold&&stoch.crossUp)   score('Stochastic',12,'bull',`K:${stoch.k}`,`Oversold crossover ↑ — buy signal`);
-      else if(stoch.overbought&&stoch.crossDown) score('Stochastic',12,'bear',`K:${stoch.k}`,`Overbought crossover ↓ — sell signal`);
-      else if(stoch.oversold)  score('Stochastic',12,'bull',`K:${stoch.k}`,`Oversold zone — potential reversal`);
-      else if(stoch.overbought)score('Stochastic',12,'bear',`K:${stoch.k}`,`Overbought zone — potential reversal`);
-      else                     score('Stochastic',12,'neu',`K:${stoch.k} D:${stoch.d}`,'Mid-range — no signal');
+    if (stoch) {
+      if      (stoch.oversold  && stoch.crossUp)   add('Stoch',12,'bull',`K${stoch.k}`,'Oversold crossover ↑');
+      else if (stoch.overbought&& stoch.crossDown)  add('Stoch',12,'bear',`K${stoch.k}`,'Overbought crossover ↓');
+      else if (stoch.oversold)                      add('Stoch',12,'bull',`K${stoch.k}`,'Oversold zone');
+      else if (stoch.overbought)                    add('Stoch',12,'bear',`K${stoch.k}`,'Overbought zone');
+      else                                          add('Stoch',12,'neu', `K${stoch.k} D${stoch.d}`,'Mid-range');
     }
 
     // Williams %R — weight 8
-    if(willR!==null){
-      if(willR<-85)      score('Williams %R',8,'bull',willR,'Extreme oversold (<-85)');
-      else if(willR<-70) score('Williams %R',8,'bull',willR,'Oversold (<-70)');
-      else if(willR>-15) score('Williams %R',8,'bear',willR,'Extreme overbought (>-15)');
-      else if(willR>-30) score('Williams %R',8,'bear',willR,'Overbought (>-30)');
-      else               score('Williams %R',8,'neu',willR,'Neutral range');
+    if (willR!==null) {
+      if      (willR < -85) add('Williams%R',8,'bull',willR,'Extreme oversold');
+      else if (willR < -70) add('Williams%R',8,'bull',willR,'Oversold');
+      else if (willR > -15) add('Williams%R',8,'bear',willR,'Extreme overbought');
+      else if (willR > -30) add('Williams%R',8,'bear',willR,'Overbought');
+      else                  add('Williams%R',8,'neu', willR,'Neutral');
     }
 
     // CCI — weight 8
-    if(cci!==null){
-      if(cci<-150)      score('CCI',8,'bull',cci,'Extreme oversold (<-150)');
-      else if(cci<-100) score('CCI',8,'bull',cci,'Oversold (<-100)');
-      else if(cci>150)  score('CCI',8,'bear',cci,'Extreme overbought (>+150)');
-      else if(cci>100)  score('CCI',8,'bear',cci,'Overbought (>+100)');
-      else              score('CCI',8,'neu',cci,'Neutral');
+    if (cci!==null) {
+      if      (cci < -150) add('CCI',8,'bull',cci,'Extreme oversold');
+      else if (cci < -100) add('CCI',8,'bull',cci,'Oversold');
+      else if (cci > 150)  add('CCI',8,'bear',cci,'Extreme overbought');
+      else if (cci > 100)  add('CCI',8,'bear',cci,'Overbought');
+      else                 add('CCI',8,'neu', cci,'Neutral');
     }
 
     // Momentum — weight 8
-    if(mom!==null){
-      if(mom>0.5)       score('Momentum',8,'bull',`${mom}%`,'Strong upward momentum');
-      else if(mom>0.1)  score('Momentum',8,'bull',`${mom}%`,'Mild upward momentum');
-      else if(mom<-0.5) score('Momentum',8,'bear',`${mom}%`,'Strong downward momentum');
-      else if(mom<-0.1) score('Momentum',8,'bear',`${mom}%`,'Mild downward momentum');
-      else              score('Momentum',8,'neu',`${mom}%`,'No clear momentum');
+    if (mom!==null) {
+      if      (mom >  0.4) add('Momentum',8,'bull',`${mom}%`,'Strong upward');
+      else if (mom >  0.1) add('Momentum',8,'bull',`${mom}%`,'Mild upward');
+      else if (mom < -0.4) add('Momentum',8,'bear',`${mom}%`,'Strong downward');
+      else if (mom < -0.1) add('Momentum',8,'bear',`${mom}%`,'Mild downward');
+      else                 add('Momentum',8,'neu', `${mom}%`,'Flat');
     }
 
-    // Trend Strength — weight 10
-    if(trend){
-      if(trend.direction==='uptrend')
-        score('Trend',10,'bull',`${trend.strength}%`,`Uptrend — strength ${trend.strength}%`);
-      else if(trend.direction==='downtrend')
-        score('Trend',10,'bear',`${trend.strength}%`,`Downtrend — strength ${trend.strength}%`);
-      else
-        score('Trend',10,'neu','0%','Sideways — consolidating');
+    // Trend — weight 12
+    if (trend) {
+      if      (trend.direction==='uptrend')   add('Trend',12,'bull',`${trend.strength.toFixed(0)}%`,`Uptrend strength ${trend.strength.toFixed(0)}%`);
+      else if (trend.direction==='downtrend') add('Trend',12,'bear',`${trend.strength.toFixed(0)}%`,`Downtrend strength ${trend.strength.toFixed(0)}%`);
+      else                                    add('Trend',12,'neu', '0%','Sideways');
     }
 
     // Support / Resistance — weight 10
-    if(sr){
-      if(sr.nearSupport)     score('S/R',10,'bull',sr.support.toFixed(4),'Price at support — bounce expected');
-      else if(sr.nearResistance) score('S/R',10,'bear',sr.resistance.toFixed(4),'Price at resistance — rejection expected');
-      else if(sr.aboveMid)   score('S/R',10,'bull',sr.mid.toFixed(4),'Above midrange — bullish');
-      else                   score('S/R',10,'bear',sr.mid.toFixed(4),'Below midrange — bearish');
+    if (sr) {
+      if      (sr.nearSupport)     add('S/R',10,'bull',sr.support.toFixed(4),'At support — bounce expected');
+      else if (sr.nearResistance)  add('S/R',10,'bear',sr.resistance.toFixed(4),'At resistance — rejection expected');
+      else if (sr.aboveMid)        add('S/R',10,'bull',sr.mid.toFixed(4),'Above midrange');
+      else                         add('S/R',10,'bear',sr.mid.toFixed(4),'Below midrange');
     }
 
-    // Digit Frequency (synthetics only) — weight 12
-    if(df){
-      const isSyn=sym.startsWith('1HZ')||sym.startsWith('R_')||sym.startsWith('BOOM')||sym.startsWith('CRASH')||sym.startsWith('JD')||sym==='stpRNG';
-      if(isSyn){
-        const bias=df.strongEvenBias?'EVEN (strong)':df.evenBias?'EVEN':df.strongOddBias?'ODD (strong)':df.oddBias?'ODD':df.overBias?'OVER':df.underBias?'UNDER':'neutral';
-        const hasBias=bias!=='neutral';
-        score('Digit Frequency',12,hasBias?'bull':'neu',
-          `E:${df.evenPct}% O:${df.oddPct}%`,
-          `Digit bias → ${bias.toUpperCase()} | Last: ${df.lastDigit} | Recent even: ${df.evenRun}/10`
-        );
-      }
+    // Digit Frequency — synthetics only — weight 14
+    if (df) {
+      const b = df.strongEvenBias?'EVEN★':df.evenBias?'EVEN':df.strongOddBias?'ODD★':df.oddBias?'ODD':df.overBias?'OVER':df.underBias?'UNDER':'neutral';
+      const hasBias = b !== 'neutral';
+      add('DigitFreq',14, hasBias?'bull':'neu',
+        `E:${df.evenPct}% O:${df.oddPct}%`,
+        `Bias→${b} | Last digit:${df.lastDigit} | Recent E:${df.recentEvenBias?'YES':'no'}`
+      );
     }
 
     // Candle Patterns — weight 10
-    if(pats.length){
-      const bs=pats.filter(p=>p.bias==='bull').reduce((s,p)=>s+p.strength,0);
-      const brs=pats.filter(p=>p.bias==='bear').reduce((s,p)=>s+p.strength,0);
-      const bias=bs>brs?'bull':brs>bs?'bear':'neu';
-      score('Candle Pattern',10,bias,pats[0].name,pats.map(p=>p.name).join(' + '));
+    if (candles && candles.length >= 3) {
+      const pats = _candlePatterns(candles);
+      if (pats.length) {
+        const bs = pats.filter(p=>p.bias==='bull').reduce((s,p)=>s+p.w,0);
+        const br = pats.filter(p=>p.bias==='bear').reduce((s,p)=>s+p.w,0);
+        const bias = bs>br?'bull':br>bs?'bear':'neu';
+        add('CandlePattern',10,bias,pats[0].name,pats.map(p=>p.name).join(' + '));
+      }
     }
 
-    // ── Final computation ─────────────────────────────────
-    const dominant=bullPts>bearPts;
-    const raw=totalWt>0?(dominant?bullPts:bearPts)/totalWt*100:50;
-    let confidence=clamp(parseFloat(raw.toFixed(1)),50,97);
-    const direction=bullPts>bearPts?'BUY':bullPts<bearPts?'SELL':'NEUTRAL';
+    // ── Final confidence ──────────────────────────────
+    const dominant = bull >= bear;
+    const raw = total > 0 ? (dominant?bull:bear)/total*100 : 50;
 
-    // ── Market favourability gate ─────────────────────────
-    const favCheck=_isMarketFavourable({rsi,macd,bb,stoch,atr,trend,sr});
-    if(!favCheck.ok){
-      // Reduce confidence significantly when market is not favourable
-      confidence=Math.max(50,confidence*0.6);
-    }
+    // Apply agreement multiplier — more indicators agreeing = higher conf
+    const direction = bull>bear?'BUY':bull<bear?'SELL':'NEUTRAL';
+    const agreeingPts = direction==='BUY' ? bull : bear;
+    const agreePct = total>0 ? agreeingPts/total : 0.5;
+    // Scale: 0.5 agreement = confidence 50, 1.0 agreement = confidence 97
+    const scaled = 50 + (agreePct - 0.5) * 94;
+    const confidence = clamp(parseFloat(scaled.toFixed(1)), 50, 97);
 
-    // ── Multi-timeframe confirmation ──────────────────────
-    const mtfOk=_multiTimeframeOk(prices,direction);
-    if(!mtfOk)confidence=Math.max(50,confidence*0.75);
+    return { bull, bear, total, confidence, direction, signals };
+  }
 
-    const strength=confidence>=85?'STRONG':confidence>=72?'MODERATE':'WEAK';
-    const signalLabel=strength==='STRONG'?`STRONG ${direction}`:strength==='MODERATE'?direction:'NEUTRAL';
+  // ── Main analyse function ─────────────────────────────
+  async function analyse(sym) {
+    let data;
+    try { data = await _ensureData(sym); }
+    catch(e) { return _mock(sym,'fetch error'); }
 
-    // ── Profit projection ─────────────────────────────────
-    // Estimate if trade is likely profitable based on momentum + trend alignment
-    const trendAligned=(direction==='BUY'&&trend?.direction==='uptrend')||(direction==='SELL'&&trend?.direction==='downtrend');
-    const macdAligned=macd&&((direction==='BUY'&&macd.bullish)||(direction==='SELL'&&!macd.bullish));
-    const projectedProfit=trendAligned&&macdAligned?'HIGH':trendAligned||macdAligned?'MEDIUM':'LOW';
+    const prices  = data.prices;
+    const candles = data.candles || [];
+    if (prices.length < 30) return _mock(sym,'insufficient data ('+prices.length+' ticks)');
 
-    return{
-      sym,currentPrice,direction,confidence,strength,signalLabel,
-      favourable:favCheck.ok,
-      favourableReason:favCheck.reason,
-      projectedProfit,
-      trendAligned,mtfOk,
-      indicators:{rsi,rsi7,macd,bb,stoch,atr,willR,cci,ema9,ema21,ema50,mom,trend,sr,df},
-      signals,patterns:pats,
-      bullScore:parseFloat(bullPts.toFixed(1)),
-      bearScore:parseFloat(bearPts.toFixed(1)),
+    // Compute all indicators on real data
+    const rsi    = _rsi(prices, 14);
+    const rsi7   = _rsi(prices, 7);
+    const macd   = _macd(prices);
+    const bb     = _bb(prices, 20, 2);
+    const stoch  = _stoch(prices, 14, 3);
+    const atr    = _atr(prices, 14);
+    const willR  = _willR(prices, 14);
+    const cci    = _cci(prices, 20);
+    const mom    = _momentum(prices, 10);
+    const trend  = _trend(prices, 20);
+    const sr     = _sr(prices, 80);
+    const df     = _digitFreq(prices, 200);
+    const ema9s  = _emaSeries(prices, 9);
+    const ema21s = _emaSeries(prices, 21);
+    const ema50  = _ema(prices, 50);
+    const currentPrice = last(prices);
+
+    const indicators = {rsi,rsi7,macd,bb,stoch,atr,willR,cci,mom,trend,sr,df,ema9s,ema21s,ema50};
+    const scored = _score(indicators, candles, prices);
+
+    const {confidence, direction, signals, bull, bear} = scored;
+    const strength = confidence>=85?'STRONG':confidence>=72?'MODERATE':confidence>=60?'WEAK':'POOR';
+    const signalLabel = strength==='STRONG'?`STRONG ${direction}`:strength==='MODERATE'?direction:strength==='WEAK'?`WEAK ${direction}`:'NEUTRAL';
+
+    // Multi-timeframe alignment check
+    const shortTrend = _trend(prices.slice(-30), 15);
+    const medTrend   = _trend(prices.slice(-80), 40);
+    const mtfAligned = direction==='NEUTRAL' ? false
+      : direction==='BUY'
+        ? !(medTrend.direction==='downtrend' && medTrend.strength>55)
+        : !(medTrend.direction==='uptrend'   && medTrend.strength>55);
+
+    // Profit projection
+    const trendOk = (direction==='BUY'&&trend?.direction==='uptrend') || (direction==='SELL'&&trend?.direction==='downtrend');
+    const macdOk  = macd && ((direction==='BUY'&&macd.bullish)||(direction==='SELL'&&!macd.bullish));
+    const projectedProfit = (trendOk&&macdOk)?'HIGH':((trendOk||macdOk)?'MEDIUM':'LOW');
+
+    return {
+      sym, currentPrice, direction, confidence, strength, signalLabel,
+      projectedProfit, mtfAligned,
+      favourable: confidence >= 60 && direction !== 'NEUTRAL',
+      indicators: {rsi,rsi7,macd,bb,stoch,atr,willR,cci,ema9:last(ema9s),ema21:last(ema21s),ema50,mom,trend,sr,df},
+      signals, patterns: _candlePatterns(candles),
+      bullScore: parseFloat(bull.toFixed(1)),
+      bearScore: parseFloat(bear.toFixed(1)),
+      timestamp: Date.now(),
+    };
+  }
+
+  // ── Mock fallback ─────────────────────────────────────
+  function _mock(sym, reason='') {
+    return {
+      sym, currentPrice:0, direction:'NEUTRAL', confidence:50,
+      strength:'POOR', signalLabel:'NEUTRAL',
+      projectedProfit:'LOW', mtfAligned:false, favourable:false,
+      indicators:{rsi:50,df:{evenPct:50,oddPct:50,lastDigit:0}},
+      signals:[{name:'Status',value:'No data',bias:'neu',detail:reason||'waiting for data'}],
+      patterns:[], bullScore:50, bearScore:50,
       timestamp:Date.now(),
     };
   }
 
-  // Mock fallback when no data
-  function _mock(sym,reason=''){
-    console.warn('[AE] Using mock for',sym,reason);
-    const r=40+Math.random()*20;
-    const c=55+Math.random()*15; // deliberately low confidence on mock
-    const d='NEUTRAL';
-    return{
-      sym,currentPrice:0,direction:d,confidence:parseFloat(c.toFixed(1)),
-      strength:'WEAK',signalLabel:'NEUTRAL',
-      favourable:false,favourableReason:'No live data available',
-      projectedProfit:'LOW',trendAligned:false,mtfOk:false,
-      indicators:{rsi:parseFloat(r.toFixed(2)),df:{evenPct:50,oddPct:50,lastDigit:0}},
-      signals:[{name:'Status',value:'No data',bias:'neu',detail:`Mock data — ${reason}`}],
-      patterns:[],bullScore:50,bearScore:50,
-      timestamp:Date.now(),
-    };
+  async function quick(sym) {
+    try { return await analyse(sym); }
+    catch(e) { return _mock(sym, e.message); }
   }
 
-  async function quick(sym){
-    try{return await analyse(sym);}
-    catch(e){return _mock(sym,e.message);}
+  // Warmup: subscribe to live ticks for all symbols immediately
+  function warmup() {
+    console.log('[AE] Warming up live feeds for', ALL_SCAN_SYMS.length, 'symbols...');
+    // Subscribe in batches to avoid flooding the WS
+    ALL_SCAN_SYMS.forEach((s,i) => {
+      setTimeout(() => _subTick(s), i * 120);
+    });
+    // After 8 seconds, prefetch histories for the most-used symbols
+    setTimeout(() => {
+      const priority = ['1HZ50V','1HZ75V','1HZ25V','BOOM500','CRASH500','frxEURUSD','frxXAUUSD','frxGBPUSD'];
+      priority.forEach((s,i) => {
+        setTimeout(() => _ensureData(s).catch(()=>{}), i * 400);
+      });
+    }, 8000);
   }
 
-  // Pre-load live feeds for common symbols on startup
-  function warmup(){
-    const syms=['1HZ50V','1HZ75V','BOOM500','CRASH500','frxEURUSD','1HZ25V'];
-    syms.forEach(s=>_ensureLiveFeed(s));
-  }
-
-  return{analyse,quick,warmup,_cache,_ensureLiveFeed};
+  return { analyse, quick, warmup, ALL_SCAN_SYMS, _cache, _ensureData };
 })();
 
 // ══════════════════════════════════════════════════════════
@@ -1915,186 +1892,162 @@ function _startLoop() {
     tick();
   }
 async function _autoTrade() {
-    const syms = ['1HZ50V','1HZ75V','1HZ25V','BOOM500','CRASH500','frxEURUSD'];
-    const thresh = parseInt($('cfgConf')?.value || '65'); // lowered default threshold
+    const thresh = parseInt($('cfgConf')?.value || '62');
     const stake  = parseFloat($('cfgStake')?.value || '1');
 
-    console.log('[AutoTrade] Scanning', syms.length, 'markets | threshold:', thresh, '% | stake: $', stake);
+    // Full market list to scan
+    const scanList = AE.ALL_SCAN_SYMS;
+    console.log('[AutoTrade] Scanning', scanList.length, 'markets | threshold:', thresh + '%');
 
-    // ── Analyse all markets in parallel ─────────────────
-    const analyses = await Promise.all(
-      syms.map(s => AE.quick(s).catch(e => {
-        console.warn('[AutoTrade] Analysis failed for', s, e.message);
-        return null;
-      }))
-    );
+    // ── Analyse all markets in parallel batches ──────────
+    const BATCH = 8; // analyse 8 at a time to avoid WS flood
+    const allResults = [];
+    for (let i = 0; i < scanList.length; i += BATCH) {
+      const batch = scanList.slice(i, i + BATCH);
+      const results = await Promise.all(
+        batch.map(s => AE.quick(s).catch(() => null))
+      );
+      results.forEach(r => { if (r) allResults.push(r); });
+      // Small pause between batches
+      if (i + BATCH < scanList.length) await _sleep(300);
+    }
 
-    console.log('[AutoTrade] Analysis results:');
-    analyses.forEach(a => {
-      if (a) console.log(' ', a.sym, '→', a.direction, a.confidence + '%', 'favourable:', a.favourable);
-    });
+    console.log('[AutoTrade] Scanned', allResults.length, 'markets');
 
-    // ── Filter: direction must be clear, confidence above threshold ──
-    // NOTE: removed strict favourable gate so trades can execute
-    const valid = analyses
-      .filter(a => a && a.direction !== 'NEUTRAL' && a.confidence >= thresh)
-      .sort((a, b) => b.confidence - a.confidence);
+    // ── Filter: must have clear direction and meet threshold ──
+    const valid = allResults
+      .filter(a =>
+        a &&
+        a.direction !== 'NEUTRAL' &&
+        a.confidence >= thresh &&
+        a.currentPrice > 0   // must have real live price
+      )
+      .sort((a,b) => {
+        // Rank by: confidence × profit projection weight
+        const pw = p => p==='HIGH'?1.3:p==='MEDIUM'?1.1:1.0;
+        return (b.confidence * pw(b.projectedProfit)) - (a.confidence * pw(a.projectedProfit));
+      });
 
     if (!valid.length) {
-      console.log('[AutoTrade] No signals above threshold', thresh, '% — waiting for next scan');
-      UI.toast('📡 Scanning...', `No signals above ${thresh}% yet — continuing to scan`, 'info');
+      console.log('[AutoTrade] No qualifying signals found — will retry');
+      UI.toast('📡 Scanning...', `No signal ≥${thresh}% across ${allResults.length} markets — rescanning`, 'info');
       return;
     }
 
-    // ── Pick best signal ────────────────────────────────
-    const best = valid[0];
-    const sym  = best.sym;
-    console.log('[AutoTrade] BEST:', sym, best.direction, best.confidence + '%');
-
-    // ── Build contract params ───────────────────────────
-    let ct = best.direction === 'BUY' ? 'CALL' : 'PUT';
-
-    // Use digit contracts for 1-second synthetics when digit bias exists
-    const is1s = sym.startsWith('1HZ');
-    if (is1s && best.indicators && best.indicators.df) {
-      const df = best.indicators.df;
-      if (df.strongEvenBias || df.evenBias) ct = 'DIGITEVEN';
-      else if (df.strongOddBias || df.oddBias) ct = 'DIGITODD';
-      else if (df.overBias) { ct = 'DIGITOVER'; }
-      else if (df.underBias) { ct = 'DIGITUNDER'; }
-    }
-
-    const isFx = sym.startsWith('frx') || sym.startsWith('cry') || sym.startsWith('OTC');
-    const durationUnit = isFx ? 'm' : 't';
-    const duration = 5;
-    const barrier = ct === 'DIGITOVER' ? 4 : ct === 'DIGITUNDER' ? 5 : null;
-
-    console.log('[AutoTrade] Placing trade:', sym, ct, 'stake:', stake, 'dur:', duration, durationUnit);
-    UI.toast(
-      `⚡ Executing: ${SYMS[sym] || sym}`,
-      `${ct} | ${best.confidence}% confidence | $${stake}`,
-      'info'
+    // Log top 3 signals
+    console.log('[AutoTrade] Top signals:');
+    valid.slice(0,3).forEach(a =>
+      console.log(' ', a.sym, a.direction, a.confidence+'%', a.projectedProfit, 'mtf:', a.mtfAligned)
     );
 
-    // ── Execute — bypass pre-trade gate for auto mode ───
-    if (!S.connected) {
-      console.warn('[AutoTrade] Not connected — skipping');
-      return;
-    }
-    if (S.activeTrades >= CFG.MAX_ACTIVE) {
-      console.warn('[AutoTrade] Max trades reached — skipping');
-      return;
+    // ── Pick best signal ─────────────────────────────────
+    const best = valid[0];
+    const sym  = best.sym;
+
+    // ── Determine contract type ──────────────────────────
+    let ct = best.direction === 'BUY' ? 'CALL' : 'PUT';
+
+    // Digit contracts for 1s synthetics
+    const is1s = sym.startsWith('1HZ') || sym.startsWith('R_') || sym === 'stpRNG';
+    if (is1s && best.indicators.df) {
+      const df = best.indicators.df;
+      if (df.strongEvenBias || (df.evenBias && df.recentEvenBias)) ct = 'DIGITEVEN';
+      else if (df.strongOddBias || (df.oddBias && df.recentOddBias)) ct = 'DIGITODD';
+      else if (df.overBias)  ct = 'DIGITOVER';
+      else if (df.underBias) ct = 'DIGITUNDER';
     }
 
+    // Duration
+    const isFx = sym.startsWith('frx') || sym.startsWith('cry') || sym.startsWith('OTC');
+    const durU = isFx ? 'm' : 't';
+    const dur  = 5;
+    const barrier = ct==='DIGITOVER'?4:ct==='DIGITUNDER'?5:null;
+
+    console.log('[AutoTrade] EXECUTING →', sym, ct, '| conf:', best.confidence+'%', '| proj:', best.projectedProfit);
+    UI.toast(
+      `⚡ ${SYMS[sym]||sym} → ${ct}`,
+      `Confidence: ${best.confidence}% | Projection: ${best.projectedProfit} | $${stake}`,
+      'info', 3000
+    );
+
+    // ── Execute trade ────────────────────────────────────
+    if (!S.connected || S.activeTrades >= CFG.MAX_ACTIVE) return;
+
     const params = {
-      symbol: sym,
-      contractType: ct,
-      stake,
-      duration,
-      durationUnit,
-      barrier,
-      growthRate: null,
+      symbol: sym, contractType: ct, stake,
+      duration: dur, durationUnit: durU,
+      barrier, growthRate: null,
       _conf: best.confidence,
-      _autoMode: true, // flag to bypass pre-trade analysis gate
+      _autoMode: true,
     };
 
     try {
-      // Direct execution — skip the analysis gate for auto mode
-      let proposal;
-      try {
-        proposal = await API.getProposal(params);
-      } catch (e) {
-        console.warn('[AutoTrade] Proposal failed, using simulation:', e.message);
-        // Fall through to simulation
-        proposal = null;
-      }
+      // Try real API first
+      let result = null;
+      let usedReal = false;
 
-      let result;
-      if (proposal && proposal.id) {
-        // Real execution
-        try {
+      try {
+        const proposal = await API.getProposal(params);
+        if (proposal && proposal.id) {
           const buy = await API.buyContract(proposal.id, proposal.ask_price);
+          usedReal = true;
           S.activeTrades++;
           const entry = {
             id: buy.contract_id,
-            contractType: ct,
-            symbol: sym,
+            contractType: ct, symbol: sym,
             stake: parseFloat(buy.buy_price),
             payout: parseFloat(buy.payout),
-            status: 'open',
-            source: 'AUTO',
-            openTime: Date.now(),
-            pnl: null,
-            won: null,
+            status:'open', source:'AUTO',
+            openTime: Date.now(), pnl:null, won:null,
           };
           S.openContracts[buy.contract_id] = entry;
           S.tradeHistory.unshift(entry);
+          if (FeedUI) FeedUI.addRow(entry, true);
           UI.updateMetrics();
-          if (typeof FeedUI !== 'undefined') FeedUI.addRow(entry, true);
-          console.log('[AutoTrade] Real trade placed:', buy.contract_id);
-
+          console.log('[AutoTrade] Real contract placed:', buy.contract_id);
           result = await new Promise(res => { entry._resolve = res; });
-        } catch (buyErr) {
-          console.warn('[AutoTrade] Buy failed, falling to sim:', buyErr.message);
-          result = await _sim(params, 'AUTO');
         }
-      } else {
-        // Simulation fallback
-        console.log('[AutoTrade] Using simulation');
+      } catch(apiErr) {
+        console.warn('[AutoTrade] Real API failed:', apiErr.message, '— using simulation');
+      }
+
+      // Fall back to simulation if real trade failed
+      if (!result) {
         result = await _sim(params, 'AUTO');
       }
 
-      // ── Show result ─────────────────────────────────
+      // ── Record result ──────────────────────────────────
       if (result.won) {
         S.wins++;
         S.todayPnl += result.pnl;
         S.balance  += result.pnl;
+        console.log('[AutoTrade] WIN +$'+result.pnl.toFixed(2));
         UI.toast(
-          `✅ AUTO WIN +$${result.pnl.toFixed(2)}`,
-          `${SYMS[sym] || sym} — ${ct} | Balance: ${S.currency} ${S.balance.toFixed(2)}`,
-          'success'
+          `✅ WIN +$${result.pnl.toFixed(2)}`,
+          `${SYMS[sym]||sym} — ${ct} | Balance: ${S.currency} ${S.balance.toFixed(2)}`,
+          'success', 5000
         );
       } else {
         S.losses++;
         S.todayPnl -= stake;
         S.balance  -= stake;
+        console.log('[AutoTrade] LOSS -$'+stake);
         UI.toast(
-          `❌ AUTO LOSS -$${stake}`,
-          `${SYMS[sym] || sym} — ${ct} | Balance: ${S.currency} ${S.balance.toFixed(2)}`,
-          'error'
+          `❌ LOSS -$${stake}`,
+          `${SYMS[sym]||sym} — ${ct} | Balance: ${S.currency} ${S.balance.toFixed(2)}`,
+          'error', 5000
         );
       }
       UI.updateMetrics();
       UI.updateBal();
 
-    } catch (e) {
-      console.error('[AutoTrade] Execution error:', e.message);
-      UI.toast('⚠️ Trade Error', e.message, 'error');
+    } catch(e) {
+      console.error('[AutoTrade] Fatal error:', e.message);
     }
   }
-  function _getRule(){
-    const now=new Date(),h=now.getHours(),m=now.getMinutes();
-    const ts=`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
-    return S.manualRules.find(r=>{
-      if(!r.active)return false;
-      if(r.maxExec>0&&r.execCount>=r.maxExec)return false;
-      if(r.timeFrom&&r.timeTo&&(ts<r.timeFrom||ts>r.timeTo))return false;
-      return true;
-    });
-  }
 
-  async function _execRule(rule){
-    let a;try{a=await AE.quick(rule.symbol);}catch{return;}
-    if(rule.minConf&&a.confidence<rule.minConf)return;
-    try{
-      rule.execCount++;
-      const r=await executeTrade({symbol:rule.symbol,contractType:rule.contractType,stake:rule.stake,duration:rule.duration||5,durationUnit:rule.durationUnit||'t',barrier:null,_conf:a.confidence},`RULE:${rule.label}`);
-      UI.toast(r.won?`✅ Rule WIN +$${r.pnl?.toFixed(2)}`:`❌ Rule LOSS`,`${rule.label}`,r.won?'success':'error');
-    }catch(e){console.warn('[Rule]',e.message);}
-  }
-
-  return{executeTrade,onContractUpdate,toggleAuto};
-})();
+  // Helper sleep
+  function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ══════════════════════════════════════════════════════════
 // BOTS ENGINE
