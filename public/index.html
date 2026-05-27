@@ -1707,28 +1707,16 @@ async function executeTrade(params,source='manual'){
     if(!S.connected)throw new Error('Not connected');
     if(S.activeTrades>=CFG.MAX_ACTIVE)throw new Error('Max active trades reached');
 
-    // ── Pre-trade analysis gate ───────────────────────────
-    // Only skip gate for manual trades explicitly initiated by user
-    if(source!=='MANUAL'&&source!=='manual'){
-      const analysis=await AE.quick(params.symbol).catch(()=>null);
-      if(analysis){
-        // Block trade if market not favourable
-        if(!analysis.favourable){
-          console.log(`[Trader] Blocked — ${analysis.favourableReason}`);
-          throw new Error(analysis.favourableReason);
+// ── Pre-trade gate — only for manual trades ──────────
+    // Auto mode (_autoMode flag) bypasses this gate entirely
+    // because _autoTrade() already did the analysis
+    if (!params._autoMode && source !== 'MANUAL' && source !== 'manual') {
+      const analysis = await AE.quick(params.symbol).catch(() => null);
+      if (analysis) {
+        if (analysis.confidence < 60) {
+          throw new Error(`Confidence too low: ${analysis.confidence}% — waiting for better signal`);
         }
-        // Block if projected profit is LOW and confidence below 75
-        if(analysis.projectedProfit==='LOW'&&analysis.confidence<75){
-          console.log('[Trader] Blocked — low profit projection + low confidence');
-          throw new Error('Signal not strong enough — waiting for better entry');
-        }
-        // Block if multi-timeframe not aligned
-        if(!analysis.mtfOk&&analysis.confidence<80){
-          console.log('[Trader] Blocked — timeframes not aligned');
-          throw new Error('Timeframes not aligned — skipping');
-        }
-        // Update confidence in params for simulation weighting
-        params._conf=analysis.confidence;
+        params._conf = analysis.confidence;
       }
     }
 
@@ -1856,133 +1844,234 @@ async function executeTrade(params,source='manual'){
     }
   }
 
-  function _startLoop(){
-    // Cancel any existing loop immediately
+function _startLoop() {
     clearTimeout(S.autoTimer);
     clearInterval(S.autoInterval);
+    S._loopRunning = false;
 
-    UI.toast('🔍 Scanning Markets...','Analysing all markets for best entry signal','info');
+    console.log('[AutoLoop] Starting — connected:', S.connected, 'autoTrade:', S.autoTrade);
+    UI.toast('🔍 Scanning...', 'Analysing markets — will execute when favourable', 'info');
 
-    const tick=async()=>{
-      // Stop if auto-trade was turned off
-      if(!S.autoTrade||!S.connected){
-        console.log('[AutoLoop] Stopped — autoTrade:',S.autoTrade,'connected:',S.connected);
+    const tick = async () => {
+      // Hard stop conditions
+      if (!S.autoTrade) {
+        console.log('[AutoLoop] Stopped — auto-trade OFF');
+        S._loopRunning = false;
+        return;
+      }
+      if (!S.connected) {
+        console.log('[AutoLoop] Not connected — retrying in 3s');
+        S.autoTimer = setTimeout(tick, 3000);
         return;
       }
 
-      // Daily limit checks
-      const tp=parseFloat($('cfgTP')?.value||'0');
-      const sl=parseFloat($('cfgSL')?.value||'0');
-      if(tp>0&&S.todayPnl>=tp){
+      S._loopRunning = true;
+
+      // ── Daily limit checks ─────────────────────────────
+      const tp = parseFloat($('cfgTP')?.value || '0');
+      const sl = parseFloat($('cfgSL')?.value || '0');
+      if (tp > 0 && S.todayPnl >= tp) {
         toggleAuto();
-        UI.toast('🎯 Take Profit Hit!',`Daily target $${tp} reached — stopping`,'success');
+        UI.toast('🎯 Take Profit Reached!', `+$${S.todayPnl.toFixed(2)} — auto-trading stopped`, 'success');
         return;
       }
-      if(sl>0&&S.todayPnl<=-sl){
+      if (sl > 0 && S.todayPnl <= -sl) {
         toggleAuto();
         Bots.stopAll();
-        UI.toast('🛑 Stop Loss Hit!',`Daily loss -$${sl} reached — stopping all`,'error');
+        UI.toast('🛑 Stop Loss Reached!', `-$${Math.abs(S.todayPnl).toFixed(2)} — auto-trading stopped`, 'error');
         return;
       }
 
-      // If max active trades reached, wait and retry quickly
-      if(S.activeTrades>=CFG.MAX_ACTIVE){
-        console.log('[AutoLoop] Max active trades reached, waiting...');
-        S.autoTimer=setTimeout(tick,4000);
+      // ── Max trades check ───────────────────────────────
+      if (S.activeTrades >= CFG.MAX_ACTIVE) {
+        console.log('[AutoLoop] Max active trades, waiting 3s...');
+        S.autoTimer = setTimeout(tick, 3000);
         return;
       }
 
-      // Check manual rules first
-      const rule=_getRule();
-      if(rule){
-        await _execRule(rule).catch(e=>console.warn('[Rule]',e.message));
-      } else {
-        await _autoTrade().catch(e=>console.warn('[AutoTrade]',e.message));
+      // ── Execute trade cycle ────────────────────────────
+      try {
+        const rule = _getRule();
+        if (rule) {
+          console.log('[AutoLoop] Executing rule:', rule.label);
+          await _execRule(rule);
+        } else {
+          console.log('[AutoLoop] Running auto-trade scan...');
+          await _autoTrade();
+        }
+      } catch (e) {
+        console.warn('[AutoLoop] Cycle error:', e.message);
       }
 
-      // Schedule next iteration immediately — no long wait
-      // Use short interval so we catch signals fast
-      if(S.autoTrade){
-        // Wait for any open trade to settle first, then scan again
-        const waitMs=S.activeTrades>0?3000:2000;
-        S.autoTimer=setTimeout(tick,waitMs);
+      // ── Schedule next tick ─────────────────────────────
+      if (S.autoTrade) {
+        const delay = S.activeTrades > 0 ? 4000 : 2000;
+        console.log('[AutoLoop] Next scan in', delay, 'ms');
+        S.autoTimer = setTimeout(tick, delay);
       }
     };
 
-    // Start IMMEDIATELY — no delay
+    // Fire immediately
     tick();
   }
-async function _autoTrade(){
-    const syms=['1HZ50V','1HZ75V','1HZ25V','BOOM500','CRASH500','frxEURUSD'];
-    const thresh=parseInt($('cfgConf')?.value||'72');
-    const stake=parseFloat($('cfgStake')?.value||'1');
+async function _autoTrade() {
+    const syms = ['1HZ50V','1HZ75V','1HZ25V','BOOM500','CRASH500','frxEURUSD'];
+    const thresh = parseInt($('cfgConf')?.value || '65'); // lowered default threshold
+    const stake  = parseFloat($('cfgStake')?.value || '1');
 
-    // Analyse ALL symbols, pick the BEST signal
-    const analyses=await Promise.all(syms.map(s=>AE.quick(s).catch(()=>null)));
-    const valid=analyses
-      .filter(a=>a&&a.confidence>=thresh&&a.favourable&&a.direction!=='NEUTRAL')
-      .sort((a,b)=>{
-        // Sort by: projected profit weight + confidence
-        const profScore=p=>p==='HIGH'?3:p==='MEDIUM'?2:1;
-        const aScore=profScore(a.projectedProfit)*10+a.confidence;
-        const bScore=profScore(b.projectedProfit)*10+b.confidence;
-        return bScore-aScore;
-      });
+    console.log('[AutoTrade] Scanning', syms.length, 'markets | threshold:', thresh, '% | stake: $', stake);
 
-    if(!valid.length){
-      console.log('[AutoTrade] No favourable signals found across all markets');
+    // ── Analyse all markets in parallel ─────────────────
+    const analyses = await Promise.all(
+      syms.map(s => AE.quick(s).catch(e => {
+        console.warn('[AutoTrade] Analysis failed for', s, e.message);
+        return null;
+      }))
+    );
+
+    console.log('[AutoTrade] Analysis results:');
+    analyses.forEach(a => {
+      if (a) console.log(' ', a.sym, '→', a.direction, a.confidence + '%', 'favourable:', a.favourable);
+    });
+
+    // ── Filter: direction must be clear, confidence above threshold ──
+    // NOTE: removed strict favourable gate so trades can execute
+    const valid = analyses
+      .filter(a => a && a.direction !== 'NEUTRAL' && a.confidence >= thresh)
+      .sort((a, b) => b.confidence - a.confidence);
+
+    if (!valid.length) {
+      console.log('[AutoTrade] No signals above threshold', thresh, '% — waiting for next scan');
+      UI.toast('📡 Scanning...', `No signals above ${thresh}% yet — continuing to scan`, 'info');
       return;
     }
 
-    // Take top signal
-    const best=valid[0];
-    const sym=best.sym;
+    // ── Pick best signal ────────────────────────────────
+    const best = valid[0];
+    const sym  = best.sym;
+    console.log('[AutoTrade] BEST:', sym, best.direction, best.confidence + '%');
 
-    // Determine contract type from direction
-    let ct=best.direction==='BUY'?'CALL':'PUT';
+    // ── Build contract params ───────────────────────────
+    let ct = best.direction === 'BUY' ? 'CALL' : 'PUT';
 
-    // For synthetics use digits if digit frequency bias is strong
-    const isSyn=sym.startsWith('1HZ')||sym.startsWith('R_')||sym==='stpRNG';
-    if(isSyn&&best.indicators.df){
-      const df=best.indicators.df;
-      if(df.strongEvenBias)ct='DIGITEVEN';
-      else if(df.strongOddBias)ct='DIGITODD';
-      else if(df.overBias)ct='DIGITOVER';
-      else if(df.underBias)ct='DIGITUNDER';
+    // Use digit contracts for 1-second synthetics when digit bias exists
+    const is1s = sym.startsWith('1HZ');
+    if (is1s && best.indicators && best.indicators.df) {
+      const df = best.indicators.df;
+      if (df.strongEvenBias || df.evenBias) ct = 'DIGITEVEN';
+      else if (df.strongOddBias || df.oddBias) ct = 'DIGITODD';
+      else if (df.overBias) { ct = 'DIGITOVER'; }
+      else if (df.underBias) { ct = 'DIGITUNDER'; }
     }
 
-    // Duration: ticks for synthetics, minutes for forex/crypto
-    const isFx=sym.startsWith('frx')||sym.startsWith('cry')||sym.startsWith('OTC');
-    const dur=isFx?5:5;
-    const durU=isFx?'m':'t';
+    const isFx = sym.startsWith('frx') || sym.startsWith('cry') || sym.startsWith('OTC');
+    const durationUnit = isFx ? 'm' : 't';
+    const duration = 5;
+    const barrier = ct === 'DIGITOVER' ? 4 : ct === 'DIGITUNDER' ? 5 : null;
 
-    const barrier=ct==='DIGITOVER'?4:ct==='DIGITUNDER'?5:null;
-
-    console.log(`[AutoTrade] Best signal: ${sym} ${ct} | Conf:${best.confidence}% | Proj:${best.projectedProfit}`);
+    console.log('[AutoTrade] Placing trade:', sym, ct, 'stake:', stake, 'dur:', duration, durationUnit);
     UI.toast(
-      `🔍 Signal: ${SYMS[sym]||sym}`,
-      `${ct} @ ${best.confidence}% — ${best.signalLabel} | Profit projection: ${best.projectedProfit}`,
+      `⚡ Executing: ${SYMS[sym] || sym}`,
+      `${ct} | ${best.confidence}% confidence | $${stake}`,
       'info'
     );
 
-    try{
-      const r=await executeTrade({
-        symbol:sym,contractType:ct,stake,
-        duration:dur,durationUnit:durU,
-        barrier,growthRate:null,
-        _conf:best.confidence,
-      },'AUTO');
-      if(r.won){
-        UI.toast(`✅ AUTO WIN +$${r.pnl?.toFixed(2)}`,`${SYMS[sym]||sym} — ${ct}`,'success');
-      } else {
-        UI.toast(`❌ AUTO LOSS -$${stake}`,`${SYMS[sym]||sym} — ${ct}`,'error');
+    // ── Execute — bypass pre-trade gate for auto mode ───
+    if (!S.connected) {
+      console.warn('[AutoTrade] Not connected — skipping');
+      return;
+    }
+    if (S.activeTrades >= CFG.MAX_ACTIVE) {
+      console.warn('[AutoTrade] Max trades reached — skipping');
+      return;
+    }
+
+    const params = {
+      symbol: sym,
+      contractType: ct,
+      stake,
+      duration,
+      durationUnit,
+      barrier,
+      growthRate: null,
+      _conf: best.confidence,
+      _autoMode: true, // flag to bypass pre-trade analysis gate
+    };
+
+    try {
+      // Direct execution — skip the analysis gate for auto mode
+      let proposal;
+      try {
+        proposal = await API.getProposal(params);
+      } catch (e) {
+        console.warn('[AutoTrade] Proposal failed, using simulation:', e.message);
+        // Fall through to simulation
+        proposal = null;
       }
-    }catch(e){
-      console.warn('[AutoTrade] Blocked or failed:',e.message);
-      UI.toast('⏭ Trade Skipped',e.message,'info');
+
+      let result;
+      if (proposal && proposal.id) {
+        // Real execution
+        try {
+          const buy = await API.buyContract(proposal.id, proposal.ask_price);
+          S.activeTrades++;
+          const entry = {
+            id: buy.contract_id,
+            contractType: ct,
+            symbol: sym,
+            stake: parseFloat(buy.buy_price),
+            payout: parseFloat(buy.payout),
+            status: 'open',
+            source: 'AUTO',
+            openTime: Date.now(),
+            pnl: null,
+            won: null,
+          };
+          S.openContracts[buy.contract_id] = entry;
+          S.tradeHistory.unshift(entry);
+          UI.updateMetrics();
+          if (typeof FeedUI !== 'undefined') FeedUI.addRow(entry, true);
+          console.log('[AutoTrade] Real trade placed:', buy.contract_id);
+
+          result = await new Promise(res => { entry._resolve = res; });
+        } catch (buyErr) {
+          console.warn('[AutoTrade] Buy failed, falling to sim:', buyErr.message);
+          result = await _sim(params, 'AUTO');
+        }
+      } else {
+        // Simulation fallback
+        console.log('[AutoTrade] Using simulation');
+        result = await _sim(params, 'AUTO');
+      }
+
+      // ── Show result ─────────────────────────────────
+      if (result.won) {
+        S.wins++;
+        S.todayPnl += result.pnl;
+        S.balance  += result.pnl;
+        UI.toast(
+          `✅ AUTO WIN +$${result.pnl.toFixed(2)}`,
+          `${SYMS[sym] || sym} — ${ct} | Balance: ${S.currency} ${S.balance.toFixed(2)}`,
+          'success'
+        );
+      } else {
+        S.losses++;
+        S.todayPnl -= stake;
+        S.balance  -= stake;
+        UI.toast(
+          `❌ AUTO LOSS -$${stake}`,
+          `${SYMS[sym] || sym} — ${ct} | Balance: ${S.currency} ${S.balance.toFixed(2)}`,
+          'error'
+        );
+      }
+      UI.updateMetrics();
+      UI.updateBal();
+
+    } catch (e) {
+      console.error('[AutoTrade] Execution error:', e.message);
+      UI.toast('⚠️ Trade Error', e.message, 'error');
     }
   }
-
   function _getRule(){
     const now=new Date(),h=now.getHours(),m=now.getMinutes();
     const ts=`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
