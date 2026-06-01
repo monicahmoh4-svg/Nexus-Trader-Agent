@@ -667,7 +667,11 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
           <div class="setr"><div><div class="setn">TP / SL Hit</div></div><div class="tog on" id="notifTPSL"></div></div>
         </div>
         <div class="setc"><div class="sett">&#128221; About</div>
-          <p style="font-size:12px;color:var(--text3);line-height:1.7;margin-bottom:12px">For production, register your own App ID at <a href="https://developers.deriv.com" target="_blank" style="color:var(--accent)">developers.deriv.com</a> and update WS_ENDPOINTS in the script.</p>
+          <p style="font-size:12px;color:var(--text3);line-height:1.7;margin-bottom:12px">
+            <strong style="color:var(--accent)">App ID: 36550</strong> (registered for NEXUS TRADE).<br/>
+            For your own deployment, register at <a href="https://developers.deriv.com" target="_blank" style="color:var(--accent)">developers.deriv.com</a>,
+            create an app with <strong>Read</strong> + <strong>Trade</strong> scopes, then update <code style="color:var(--acc4)">DERIV_APP_ID</code> at the top of the script.
+          </p>
           <p style="font-size:11px;color:var(--red);line-height:1.6">&#9888; Trading involves significant financial risk. Past performance does not guarantee future results. Always test on Demo first.</p>
         </div>
       </div>
@@ -695,10 +699,15 @@ window.onerror = function(msg,src,line){
 };
 
 // ── Config ────────────────────────────────────────────────
+// ── Deriv App Registration ───────────────────────────────
+// App ID 36550 is registered for NEXUS TRADE at developers.deriv.com
+// For your own production deployment, register at https://developers.deriv.com
+// and replace 36550 with your own App ID
+const DERIV_APP_ID = 36550;
 const WS_ENDPOINTS = [
-  'wss://ws.derivws.com/websockets/v3?app_id=1089',
-  'wss://ws.binaryws.com/websockets/v3?app_id=1089',
-  'wss://frontend.binaryws.com/websockets/v3?app_id=1089',
+  'wss://ws.derivws.com/websockets/v3?app_id=' + DERIV_APP_ID,
+  'wss://ws.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID,
+  'wss://frontend.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID,
 ];
 const MAX_TRADES = 5;
 const TICK_SYMS = ['1HZ50V','1HZ75V','1HZ100V','BOOM500','CRASH500','frxEURUSD','frxGBPUSD','frxXAUUSD','cryBTCUSD','JD100'];
@@ -875,7 +884,18 @@ var API = (function(){
             _updateMetrics();
           });
           Ticker.start();Dashboard.init();
-          _toast('Connected '+S.accountType.toUpperCase(),S.loginid+' | '+S.currency+' '+S.balance.toFixed(2),'s',6000);
+          var acctLabel = S.accountType==='real' ? 'REAL MONEY ACCOUNT' : 'Demo Account';
+          _toast('Connected: '+acctLabel,
+            S.loginid+' | '+S.currency+' '+S.balance.toFixed(2)+
+            (S.accountType==='real'?' | All trades are REAL':''),
+            's',8000);
+          console.log('====================================');
+          console.log('NEXUS TRADE — Connected to Deriv');
+          console.log('Login ID:    ', S.loginid);
+          console.log('Account type:', S.accountType, '(is_virtual from Deriv)');
+          console.log('Balance:     ', S.balance, S.currency);
+          console.log('Real trades: ', S.accountType==='real' ? 'YES — affects real funds' : 'NO — demo only');
+          console.log('====================================');
           setTimeout(function(){AE.warmup();},800);
           setTimeout(function(){_updateBal();_updateMetrics();},1500);
         });
@@ -920,19 +940,41 @@ var API = (function(){
     }
     if(t==='proposal_open_contract'&&msg.proposal_open_contract)Trader.onContractUpdate(msg.proposal_open_contract);
     if(t==='balance'&&msg.balance){
-      S.balance=parseFloat(String(msg.balance.balance).replace(/,/g,''))||S.balance;
+      // This is the authoritative balance from Deriv's server
+      // Always trust this over any local calculation
+      var derivBal=parseFloat(String(msg.balance.balance).replace(/,/g,''));
+      console.log('[API] Balance stream from Deriv:',derivBal,msg.balance.currency);
+      S.balance=derivBal;
       S.currency=msg.balance.currency||S.currency;
-      _updateBal();_updateMetrics();
+      _updateBal();
+      _updateMetrics();
     }
     if(t==='transaction'&&msg.transaction){
       var tx=msg.transaction;
-      if(tx.action==='buy'){S.activeTrades++;if(tx.balance!=null)S.balance=parseFloat(tx.balance);_updateMetrics();_updateBal();}
+      console.log('[API] Transaction:',tx.action,'amount:',tx.amount,'balance:',tx.balance,'loginid:',tx.loginid);
+      if(tx.action==='buy'){
+        S.activeTrades++;
+        // Deriv sends the new balance after every transaction
+        if(tx.balance!=null){
+          var buyBal=parseFloat(String(tx.balance).replace(/,/g,''));
+          console.log('[API] Balance after buy:',buyBal);
+          S.balance=buyBal;
+        }
+        _updateMetrics();_updateBal();
+      }
       if(tx.action==='sell'){
         S.activeTrades=Math.max(0,S.activeTrades-1);
         var pp=parseFloat(tx.amount||0);
-        if(tx.balance!=null)S.balance=parseFloat(tx.balance);
-        if(pp>0){S.wins++;S.todayPnl+=pp;}else{S.losses++;S.todayPnl+=pp;}
+        if(tx.balance!=null){
+          var sellBal=parseFloat(String(tx.balance).replace(/,/g,''));
+          console.log('[API] Balance after sell:',sellBal,'profit:',pp);
+          S.balance=sellBal;
+        }
+        if(pp>0){S.wins++;S.todayPnl=parseFloat((S.todayPnl+pp).toFixed(2));}
+        else{S.losses++;S.todayPnl=parseFloat((S.todayPnl+pp).toFixed(2));}
         _updateMetrics();_updateBal();
+        // Request fresh balance 2 seconds after sell to confirm
+        setTimeout(function(){if(S.connected&&S.accountType==='real')API.requestFreshBalance();},2000);
       }
     }
   }
@@ -1002,9 +1044,24 @@ var API = (function(){
 
   function getPrice(sym){return tickPrices[sym]||null;}
 
+  // Request fresh balance from Deriv — call after trade settlement on real accounts
+  function requestFreshBalance(){
+    if(!ws||ws.readyState!==1)return;
+    _send({balance:1},function(br){
+      if(!br.error&&br.balance){
+        var newBal=parseFloat(String(br.balance.balance).replace(/,/g,''));
+        console.log('[API] Fresh balance from Deriv:',newBal,br.balance.currency);
+        S.balance=newBal;
+        S.currency=br.balance.currency||S.currency;
+        _updateBal();
+        _updateMetrics();
+      }
+    });
+  }
+
   return{connect:connect,disconnect:disconnect,subTick:subTick,getTickHist:getTickHist,
     getCandleHist:getCandleHist,getProposal:getProposal,buyContract:buyContract,
-    getProfitTable:getProfitTable,getPrice:getPrice};
+    getProfitTable:getProfitTable,getPrice:getPrice,requestFreshBalance:requestFreshBalance};
 })();
 
 // ── Ticker ────────────────────────────────────────────────
@@ -1374,14 +1431,60 @@ function _feedUpdate(entry){
 var Trader = (function(){
   function onContractUpdate(c){
     var entry=S.openContracts[c.contract_id];if(!entry)return;
+
+    // Always update current profit display while trade is open
+    if(!c.is_sold && c.status!=='sold' && c.profit!==undefined){
+      entry.currentProfit = parseFloat(c.profit||0);
+      return;
+    }
+
     if(c.is_sold||c.status==='sold'){
       var p=parseFloat(c.profit);var won=p>0;
       entry.status='closed';entry.won=won;entry.pnl=p;entry.closeTime=Date.now();
       S.activeTrades=Math.max(0,S.activeTrades-1);
-      if(won){S.wins++;S.todayPnl+=p;S.balance+=p;S.streak=S.streakType==='win'?S.streak+1:1;S.streakType='win';}
-      else{S.losses++;S.todayPnl+=p;S.balance+=p;S.streak=S.streakType==='loss'?S.streak+1:1;S.streakType='loss';}
+
+      // Update P&L tracking
+      S.todayPnl = parseFloat((S.todayPnl + p).toFixed(2));
+      if(won){
+        S.wins++;
+        S.streak = S.streakType==='win' ? S.streak+1 : 1;
+        S.streakType='win';
+      } else {
+        S.losses++;
+        S.streak = S.streakType==='loss' ? S.streak+1 : 1;
+        S.streakType='loss';
+      }
+
+      // For real accounts: balance is updated by the 'balance' subscription stream
+      // which Deriv pushes automatically after every settled contract.
+      // For demo/sim: update locally.
+      if(entry.simulated){
+        S.balance = parseFloat((S.balance + p).toFixed(2));
+      }
+      // For real accounts, trust the balance subscription (handled in _handle)
+      // but also request a fresh balance to be sure
+      if(!entry.simulated && S.connected){
+        // Request fresh balance from Deriv to ensure sync
+        setTimeout(function(){
+          API.requestFreshBalance();
+        }, 1500);
+      }
+
       delete S.openContracts[c.contract_id];
-      _updateMetrics();_feedUpdate(entry);
+      _updateMetrics();
+      _feedUpdate(entry);
+
+      // Show result toast
+      if(won){
+        _toast('WIN! +$'+p.toFixed(2),
+          (entry.real?'REAL':'Demo')+' '+entry.contractType+' on '+(SYMS[entry.symbol]||entry.symbol),
+          's',6000);
+      } else {
+        _toast('Loss -$'+Math.abs(p).toFixed(2),
+          (entry.real?'REAL':'Demo')+' '+entry.contractType+' on '+(SYMS[entry.symbol]||entry.symbol),
+          'e',5000);
+      }
+
       if(entry._resolve)entry._resolve({won:won,pnl:p,stake:entry.stake});
     }
   }
@@ -1413,18 +1516,63 @@ var Trader = (function(){
     source=source||'manual';
     if(!S.connected)return Promise.reject(new Error('Not connected'));
     if(S.activeTrades>=MAX_TRADES)return Promise.reject(new Error('Max active trades reached'));
+
+    // Determine if this is a real account — never silently simulate real trades
+    var isReal = S.accountType === 'real';
+
     return API.getProposal(params).then(function(proposal){
-      if(!proposal||!proposal.id)return _sim(params,source);
+      if(!proposal||!proposal.id){
+        if(isReal){
+          var errMsg='Proposal failed — trade NOT placed on real account';
+          _toast('Trade Failed',errMsg,'e',6000);
+          return Promise.reject(new Error(errMsg));
+        }
+        console.log('[Trade] Demo sim (no proposal)');
+        return _sim(params,source);
+      }
+
+      // Log the proposal for transparency
+      console.log('[Trade] Proposal OK — id:'+proposal.id+' ask:'+proposal.ask_price+' payout:'+proposal.payout);
+      _toast('Placing trade...','Sending to Deriv: '+params.contractType+' $'+params.stake,'i',2000);
+
       return API.buyContract(proposal.id,proposal.ask_price).then(function(buy){
+        console.log('[Trade] BUY OK — contract_id:'+buy.contract_id+' buy_price:'+buy.buy_price);
         S.activeTrades++;
-        var entry={id:buy.contract_id,contractType:params.contractType,symbol:params.symbol,
-          stake:parseFloat(buy.buy_price),payout:parseFloat(buy.payout),
-          status:'open',source:source,openTime:Date.now(),pnl:null,won:null};
-        S.openContracts[buy.contract_id]=entry;S.tradeHistory.unshift(entry);
+        var entry={
+          id:buy.contract_id,
+          contractType:params.contractType,
+          symbol:params.symbol,
+          stake:parseFloat(buy.buy_price),
+          payout:parseFloat(buy.payout),
+          status:'open',source:source,
+          openTime:Date.now(),pnl:null,won:null,
+          real: isReal,
+        };
+        S.openContracts[buy.contract_id]=entry;
+        S.tradeHistory.unshift(entry);
         _updateMetrics();_feedAdd(entry);
+        _toast('Trade Placed!',
+          (isReal?'REAL':'Demo')+' '+params.contractType+' on '+(SYMS[params.symbol]||params.symbol)+' $'+params.stake,
+          'i',3000);
         return new Promise(function(res){entry._resolve=res;});
-      }).catch(function(e){console.warn('[buy fail]',e.message);return _sim(params,source);});
-    }).catch(function(e){console.warn('[proposal fail]',e.message);return _sim(params,source);});
+      }).catch(function(e){
+        console.error('[Trade] BUY FAILED:',e.message);
+        if(isReal){
+          _toast('Buy Failed',e.message+' — no real trade placed','e',8000);
+          return Promise.reject(e);
+        }
+        console.log('[Trade] Demo sim fallback after buy error');
+        return _sim(params,source);
+      });
+    }).catch(function(e){
+      console.error('[Trade] PROPOSAL FAILED:',e.message);
+      if(isReal){
+        _toast('Proposal Failed',e.message+' — no real trade placed','e',8000);
+        return Promise.reject(e);
+      }
+      console.log('[Trade] Demo sim fallback after proposal error');
+      return _sim(params,source);
+    });
   }
 
   function toggleAuto(){
