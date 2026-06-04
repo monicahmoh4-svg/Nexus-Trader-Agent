@@ -668,9 +668,9 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
         </div>
         <div class="setc"><div class="sett">&#128221; About</div>
           <p style="font-size:12px;color:var(--text3);line-height:1.7;margin-bottom:12px">
-            <strong style="color:var(--accent)">App ID: 36550</strong> (registered for NEXUS TRADE).<br/>
-            For your own deployment, register at <a href="https://developers.deriv.com" target="_blank" style="color:var(--accent)">developers.deriv.com</a>,
-            create an app with <strong>Read</strong> + <strong>Trade</strong> scopes, then update <code style="color:var(--acc4)">DERIV_APP_ID</code> at the top of the script.
+            <strong style="color:var(--accent)">App ID: 1089</strong> (Deriv's official public app — works for all tokens).<br/>
+            For production deployment, register your own app at <a href="https://developers.deriv.com" target="_blank" style="color:var(--accent)">developers.deriv.com</a>
+            with <strong>Read</strong> + <strong>Trade</strong> scopes, then update <code style="color:var(--acc4)">const DERIV_APP_ID = 1089</code> at the top of the script.
           </p>
           <p style="font-size:11px;color:var(--red);line-height:1.6">&#9888; Trading involves significant financial risk. Past performance does not guarantee future results. Always test on Demo first.</p>
         </div>
@@ -699,11 +699,11 @@ window.onerror = function(msg,src,line){
 };
 
 // ── Config ────────────────────────────────────────────────
-// ── Deriv App Registration ───────────────────────────────
-// App ID 36550 is registered for NEXUS TRADE at developers.deriv.com
-// For your own production deployment, register at https://developers.deriv.com
-// and replace 36550 with your own App ID
-const DERIV_APP_ID = 36550;
+// ── Deriv App ID ─────────────────────────────────────────
+// App ID 1089 is Deriv's official public app — works for all tokens.
+// To use your own App ID: go to https://developers.deriv.com,
+// register an app with Read + Trade scopes, then replace 1089 below.
+const DERIV_APP_ID = 1089;
 const WS_ENDPOINTS = [
   'wss://ws.derivws.com/websockets/v3?app_id=' + DERIV_APP_ID,
   'wss://ws.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID,
@@ -740,6 +740,7 @@ const S = {
   loginid:'',todayPnl:0,wins:0,losses:0,activeTrades:0,
   autoTrade:false,autoTimer:null,streak:0,streakType:null,
   tradeHistory:[],openContracts:{},manualRules:[],_loopRunning:false,
+  _authFailed:false,  // prevents reconnect loop on bad token
 };
 
 // ── Toast ─────────────────────────────────────────────────
@@ -813,10 +814,19 @@ var API = (function(){
 
   function connect(t,type){
     type=type||'demo';
-    token=(t||'').replace(/\s+/g,'').replace(/['"]/g,'').replace(/[^\x21-\x7E]/g,'').trim();
-    if(!token||token.length<8){_toast('Invalid Token','Copy from app.deriv.com API Token page','e');return;}
+    // Clean token: remove whitespace, BOM, zero-width chars, quotes only
+    token=(t||'').replace(/[\u200B-\u200D\uFEFF]/g,'') // zero-width
+                 .replace(/[\s]/g,'')                      // all whitespace
+                 .replace(/^['"]+|['"]+$/g,'')              // leading/trailing quotes
+                 .trim();
+    if(!token||token.length<8){
+      _toast('Invalid Token','Please copy your token from app.deriv.com > Account Settings > API Token','e',7000);
+      return;
+    }
+    console.log('[API] connect() called | type:',type,'| token length:',token.length,'| first 6 chars:',token.substring(0,6));
     S.accountType=type;S.connected=false;S.balance=0;S.currency='USD';
     S.loginid='';S.wins=0;S.losses=0;S.todayPnl=0;S.activeTrades=0;
+    S._authFailed=false;
     reconnAttempts=0;wsIdx=0;
     console.log('[API] connect type:',type,'token[:6]:',token.substring(0,6));
     _setStatus('connecting');
@@ -835,7 +845,7 @@ var API = (function(){
       if(!ws||ws.readyState!==1){
         wsIdx++;
         if(wsIdx<WS_ENDPOINTS.length){_toast('Retrying...','Trying alternate server','i');_open();}
-        else{_toast('Connection Failed','All servers unreachable. Check internet.','e');_setStatus('disconnected');}
+        else{_toast('Connection Failed','Cannot reach Deriv servers. Check your internet connection and try again.','e',8000);_setStatus('disconnected');}
       }
     },10000);
     ws.onopen=function(){
@@ -844,12 +854,22 @@ var API = (function(){
       setTimeout(function(){
         _send({authorize:token},function(r){
           if(r.error){
+            var code=r.error.code||'';
             var msg=r.error.message||'Auth failed';
-            var hint=(msg.toLowerCase().indexOf('valid')>=0||msg.toLowerCase().indexOf('invalid')>=0)
-              ?'Token invalid. Go to app.deriv.com > Account Settings > API Token > create new token with Read+Trade scopes'
-              :msg;
-            _toast('Auth Failed',hint,'e',8000);
-            _setStatus('disconnected');return;
+            var hint=msg;
+            if(code==='InvalidToken'||msg.toLowerCase().indexOf('invalid token')>=0){
+              hint='Invalid token. Steps: 1) Go to app.deriv.com 2) Log into the correct account (Demo or Real) 3) Account Settings > API Token 4) Create new token with Read + Trade enabled 5) Copy the full token and paste here';
+            } else if(code==='DisabledClient'){
+              hint='Your Deriv account has been disabled. Contact Deriv support.';
+            } else if(msg.toLowerCase().indexOf('app')>=0){
+              hint='App ID error: '+msg+'. Try refreshing the page.';
+            }
+            console.error('[API] Auth error | code:',code,'| message:',msg);
+            S._authFailed=true;
+            _toast('Connection Failed',hint,'e',10000);
+            _setStatus('disconnected');
+            token=null;
+            return;
           }
           var a=r.authorize;
           var isVirtual=a.is_virtual===1||a.is_virtual==='1'||a.is_virtual===true;
@@ -905,9 +925,27 @@ var API = (function(){
     ws.onerror=function(e){console.error('[WS error]',e);};
     ws.onclose=function(e){
       clearTimeout(connTimeout);_stopPing();
-      console.log('[WS] closed code:',e.code);
-      if(S.connected){S.connected=false;_setStatus('disconnected');_toast('Disconnected','Reconnecting...','i');_schedReconn();}
-      else if(token){wsIdx++;if(wsIdx<WS_ENDPOINTS.length){setTimeout(function(){_open();},1500);}else{wsIdx=0;_schedReconn();}}
+      console.log('[WS] closed | code:',e.code,'| reason:',e.reason,'| wasClean:',e.wasClean);
+      if(S.connected){
+        // Was connected, lost connection — try to reconnect
+        S.connected=false;
+        _setStatus('disconnected');
+        _toast('Connection lost','Reconnecting to Deriv...','i');
+        _schedReconn();
+      } else if(token && !S._authFailed){
+        // Connection closed before auth — try next endpoint
+        wsIdx++;
+        if(wsIdx<WS_ENDPOINTS.length){
+          console.log('[WS] Trying next endpoint...');
+          setTimeout(function(){_open();},1500);
+        } else {
+          wsIdx=0;
+          _schedReconn();
+        }
+      } else {
+        // Auth failed — don't reconnect, show error
+        _setStatus('disconnected');
+      }
     };
   }
 
@@ -1856,14 +1894,34 @@ var Auth = (function(){
   function switchType(t){_setModalType(t);$('tokenIn').value='';$('tokenIn').focus();}
   function connect(){
     var raw=$('tokenIn').value||'';
-    var t=raw.replace(/\s+/g,'').replace(/['"]/g,'').replace(/[^\x21-\x7E]/g,'').trim();
-    if(!t){_toast('No Token','Please paste your API token','e');$('tokenIn').focus();return;}
-    if(t.length<8){_toast('Invalid Token','Too short - copy directly from Deriv','e');return;}
-    close();$('tokenIn').value='';
-    setTimeout(function(){API.connect(t,_type);},100);
+    // Clean: remove invisible chars, whitespace, surrounding quotes
+    var t=raw.replace(/[\u200B-\u200D\uFEFF]/g,'')
+             .replace(/[\s]/g,'')
+             .replace(/^['"]+|['"]+$/g,'')
+             .trim();
+    if(!t){
+      _toast('No Token','Please paste your Deriv API token in the box','e',5000);
+      $('tokenIn').focus();
+      return;
+    }
+    if(t.length<8){
+      _toast('Invalid Token','This token is too short. Copy it directly from app.deriv.com > API Token','e',6000);
+      return;
+    }
+    console.log('[Auth] Connecting | type:',_type,'| token length:',t.length,'| first 6:',t.substring(0,6));
+    // Show connecting feedback before closing modal
+    var btn=$('authConnectBtn');
+    if(btn){btn.textContent='Connecting...';btn.disabled=true;}
+    _toast('Connecting...','Opening secure connection to Deriv...','i',3000);
+    close();
+    $('tokenIn').value='';
+    setTimeout(function(){
+      if(btn){btn.textContent='Connect '+(t==='demo'?'Demo':'Real')+' Account';btn.disabled=false;}
+      API.connect(t,_type);
+    },150);
   }
   function oauth(){
-    var url='https://oauth.deriv.com/oauth2/authorize?app_id=1089&l=EN&brand=deriv';
+    var url='https://oauth.deriv.com/oauth2/authorize?app_id='+DERIV_APP_ID+'&l=EN&brand=deriv';
     var win=window.open(url,'_blank','width=640,height=720,left=200,top=80');
     _toast('Opening OAuth','Approve access in the popup','i');
     var chk=setInterval(function(){
