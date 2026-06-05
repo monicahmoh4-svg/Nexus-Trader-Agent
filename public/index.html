@@ -774,17 +774,28 @@ function _setStatus(state){
 
 function _updateBal(){
   var isReal=S.accountType==='real';
-  var lbl=isReal?'REAL':'DEMO';
+  // Format balance exactly as Deriv shows it
+  var bal=S.balance||0;
+  var cur=S.currency||'USD';
+  var balStr=cur+' '+bal.toFixed(2);
+  var lbl=isReal?'💰 REAL':'🧪 DEMO';
   var cls=isReal?'real-m':'demo-m';
-  var balStr=(S.currency||'USD')+' '+(S.balance||0).toFixed(2);
-  var b=$('accBadge');if(b){b.textContent=(isReal?'REAL':'DEMO');b.className='acc-badge '+cls;}
+  // Update every balance display element
+  var b=$('accBadge');if(b){b.textContent=lbl;b.className='acc-badge '+cls;}
   var bl=$('balBadge');if(bl){bl.style.display='block';bl.textContent=balStr;}
-  var mBal=$('mBal');if(mBal)mBal.textContent=balStr;
+  var mBal=$('mBal');if(mBal){mBal.textContent=balStr;mBal.className='mval ac';}
   var sb=$('sBal');if(sb)sb.textContent=balStr;
   var sa=$('sAT');if(sa)sa.textContent=(isReal?'REAL':'DEMO')+' ACCOUNT';
-  var sl=$('sLID');if(sl)sl.textContent=S.loginid||'--';
+  var sl=$('sLID');if(sl)sl.textContent=S.loginid||'—';
   var st=$('stext');
-  if(st&&S.connected){st.textContent=isReal?'REAL ACCOUNT LIVE':'DEMO LIVE';st.className='stext '+(isReal?'real-live':'live');}
+  if(st&&S.connected){
+    st.textContent=isReal?'🔴 REAL ACCOUNT LIVE':'🟢 DEMO LIVE';
+    st.className='stext '+(isReal?'real-live':'live');
+  }
+  // Keep header balance badge always visible when connected
+  var hBal=$('balBadge');
+  if(hBal&&S.connected){hBal.style.display='block';hBal.textContent=balStr;}
+  console.log('[UI] Balance displayed:',balStr,'| type:',S.accountType);
 }
 
 function _updateMetrics(){
@@ -811,46 +822,39 @@ function _updateMetrics(){
 var API = (function(){
   var ws=null,token=null,reqId=1,pingInt=null,reconnTimer=null,reconnAttempts=0,wsIdx=0;
   var pending={},tickSubs={},tickPrices={};
+  var _balanceSubId=null;
 
   function connect(t,type){
     type=type||'demo';
-    // Clean token: remove whitespace, BOM, zero-width chars, quotes only
-    token=(t||'').replace(/[\u200B-\u200D\uFEFF]/g,'') // zero-width
-                 .replace(/[\s]/g,'')                      // all whitespace
-                 .replace(/^['"]+|['"]+$/g,'')              // leading/trailing quotes
-                 .trim();
-    if(!token||token.length<8){
-      _toast('Invalid Token','Please copy your token from app.deriv.com > Account Settings > API Token','e',7000);
-      return;
-    }
-    console.log('[API] connect() called | type:',type,'| token length:',token.length,'| first 6 chars:',token.substring(0,6));
+    token=(t||'').replace(/[\u200B-\u200D\uFEFF]/g,'').replace(/[\s]/g,'').replace(/^['"]+|['"]+$/g,'').trim();
+    if(!token||token.length<8){_toast('Invalid Token','Copy from app.deriv.com > Account Settings > API Token','e',7000);return;}
     S.accountType=type;S.connected=false;S.balance=0;S.currency='USD';
     S.loginid='';S.wins=0;S.losses=0;S.todayPnl=0;S.activeTrades=0;
-    S._authFailed=false;
-    reconnAttempts=0;wsIdx=0;
-    console.log('[API] connect type:',type,'token[:6]:',token.substring(0,6));
-    _setStatus('connecting');
-    _open();
+    S._authFailed=false;reconnAttempts=0;wsIdx=0;
+    console.log('[API] connect | type:',type,'| token[:6]:',token.substring(0,6));
+    _setStatus('connecting');_open();
   }
 
   function _open(){
     if(ws){try{ws.onopen=null;ws.onmessage=null;ws.onerror=null;ws.onclose=null;ws.close();}catch(e){}}
     ws=null;_setStatus('connecting');
     var ep=WS_ENDPOINTS[wsIdx%WS_ENDPOINTS.length];
-    console.log('[WS] connecting to',ep);
+    console.log('[WS] Connecting to:',ep);
     var connTimeout;
     try{ws=new WebSocket(ep);}
-    catch(e){_toast('Connection Error','Cannot open WebSocket','e');_setStatus('disconnected');return;}
+    catch(e){_toast('Connection Error','Cannot open WebSocket. Check internet connection.','e');_setStatus('disconnected');return;}
     connTimeout=setTimeout(function(){
       if(!ws||ws.readyState!==1){
+        console.warn('[WS] Timeout on',ep);
         wsIdx++;
-        if(wsIdx<WS_ENDPOINTS.length){_toast('Retrying...','Trying alternate server','i');_open();}
-        else{_toast('Connection Failed','Cannot reach Deriv servers. Check your internet connection and try again.','e',8000);_setStatus('disconnected');}
+        if(wsIdx<WS_ENDPOINTS.length){_toast('Retrying...','Trying alternate Deriv server...','i',2000);_open();}
+        else{_toast('Cannot Connect','All Deriv servers unreachable. Check internet connection.','e',8000);_setStatus('disconnected');}
       }
     },10000);
+
     ws.onopen=function(){
       clearTimeout(connTimeout);reconnAttempts=0;wsIdx=0;_startPing();
-      console.log('[WS] open - authorizing...');
+      console.log('[WS] Connected — authorizing token...');
       setTimeout(function(){
         _send({authorize:token},function(r){
           if(r.error){
@@ -858,99 +862,82 @@ var API = (function(){
             var msg=r.error.message||'Auth failed';
             var hint=msg;
             if(code==='InvalidToken'||msg.toLowerCase().indexOf('invalid token')>=0){
-              hint='Invalid token. Steps: 1) Go to app.deriv.com 2) Log into the correct account (Demo or Real) 3) Account Settings > API Token 4) Create new token with Read + Trade enabled 5) Copy the full token and paste here';
-            } else if(code==='DisabledClient'){
-              hint='Your Deriv account has been disabled. Contact Deriv support.';
-            } else if(msg.toLowerCase().indexOf('app')>=0){
-              hint='App ID error: '+msg+'. Try refreshing the page.';
-            }
-            console.error('[API] Auth error | code:',code,'| message:',msg);
+              hint='Invalid token. Steps:\n1) Go to app.deriv.com\n2) Log into correct account (Demo or Real)\n3) Account Settings > API Token\n4) Create new token with READ + TRADE enabled\n5) Copy full token and paste here';
+            }else if(code==='DisabledClient'){hint='Deriv account is disabled. Contact Deriv support.';}
             S._authFailed=true;
+            console.error('[API] Auth failed | code:',code,'| msg:',msg);
             _toast('Connection Failed',hint,'e',10000);
-            _setStatus('disconnected');
-            token=null;
-            return;
+            _setStatus('disconnected');token=null;return;
           }
           var a=r.authorize;
+          // Detect account type from Deriv response — is_virtual=1 means demo
           var isVirtual=a.is_virtual===1||a.is_virtual==='1'||a.is_virtual===true;
           S.accountType=isVirtual?'demo':'real';
-          var rawBal=a.balance;
-          S.balance=rawBal!=null?parseFloat(String(rawBal).replace(/,/g,''))||0:0;
+          // Parse balance exactly as Deriv sends it
+          S.balance=a.balance!=null?parseFloat(String(a.balance).replace(/,/g,''))||0:0;
           S.currency=a.currency||'USD';
           S.loginid=a.loginid||'';
           S.connected=true;S.activeTrades=0;
-          console.log('[API] auth OK:',S.loginid,'type:',S.accountType,'bal:',S.balance,S.currency);
+          console.log('=== NEXUS TRADE CONNECTED ===');
+          console.log('LoginID:    ',S.loginid);
+          console.log('Account:    ',S.accountType,'(is_virtual='+a.is_virtual+')');
+          console.log('Balance:    ',S.balance,S.currency);
+          console.log('Real money: ',S.accountType==='real'?'YES — real funds':'NO — demo only');
+          console.log('=============================');
           _setStatus('connected');_updateBal();_updateMetrics();
+          // Subscribe to live balance stream — this is the authoritative source
           _send({balance:1,subscribe:1},function(br){
             if(!br.error&&br.balance){
-              S.balance=parseFloat(String(br.balance.balance).replace(/,/g,''))||S.balance;
-              S.currency=br.balance.currency||S.currency;
+              var b=parseFloat(String(br.balance.balance).replace(/,/g,''));
+              console.log('[API] Live balance confirmed:',b,br.balance.currency);
+              S.balance=b;S.currency=br.balance.currency||S.currency;
               _updateBal();_updateMetrics();
             }
           });
+          // Subscribe to transaction stream for real-time trade tracking
           _send({transaction:1,subscribe:1});
-          _send({balance:1},function(br2){
-            if(!br2.error&&br2.balance){
-              S.balance=parseFloat(String(br2.balance.balance).replace(/,/g,''))||S.balance;
-              S.currency=br2.balance.currency||S.currency;
-              _updateBal();_updateMetrics();
-            }
-          });
+          // Load any currently open contracts
           _send({portfolio:1},function(pr){
-            if(!pr.error)(pr.portfolio.contracts||[]).forEach(function(c){
-              _send({proposal_open_contract:1,contract_id:c.contract_id,subscribe:1});
-              S.activeTrades++;
-            });
+            if(!pr.error){
+              (pr.portfolio.contracts||[]).forEach(function(c){
+                _send({proposal_open_contract:1,contract_id:c.contract_id,subscribe:1});
+                S.activeTrades++;
+              });
+            }
             _updateMetrics();
           });
           Ticker.start();Dashboard.init();
-          var acctLabel = S.accountType==='real' ? 'REAL MONEY ACCOUNT' : 'Demo Account';
-          _toast('Connected: '+acctLabel,
-            S.loginid+' | '+S.currency+' '+S.balance.toFixed(2)+
-            (S.accountType==='real'?' | All trades are REAL':''),
-            's',8000);
-          console.log('====================================');
-          console.log('NEXUS TRADE — Connected to Deriv');
-          console.log('Login ID:    ', S.loginid);
-          console.log('Account type:', S.accountType, '(is_virtual from Deriv)');
-          console.log('Balance:     ', S.balance, S.currency);
-          console.log('Real trades: ', S.accountType==='real' ? 'YES — affects real funds' : 'NO — demo only');
-          console.log('====================================');
-          setTimeout(function(){AE.warmup();},800);
-          setTimeout(function(){_updateBal();_updateMetrics();},1500);
+          var acctLabel=S.accountType==='real'?'REAL ACCOUNT LIVE':'Demo Account';
+          _toast('Connected: '+acctLabel,S.loginid+' | '+S.currency+' '+S.balance.toFixed(2)+(S.accountType==='real'?' | REAL FUNDS':' | Demo funds'),'s',8000);
+          setTimeout(function(){AE.warmup();},500);
+          // Force balance refresh after 2s to ensure sync
+          setTimeout(function(){requestFreshBalance();},2000);
+          setTimeout(function(){_updateBal();_updateMetrics();},3000);
         });
       },300);
     };
-    ws.onmessage=function(e){try{_handle(JSON.parse(e.data));}catch(err){console.error('[WS parse]',err);}};
+
+    ws.onmessage=function(e){
+      try{_handle(JSON.parse(e.data));}catch(err){console.error('[WS parse error]',err);}
+    };
     ws.onerror=function(e){console.error('[WS error]',e);};
     ws.onclose=function(e){
       clearTimeout(connTimeout);_stopPing();
-      console.log('[WS] closed | code:',e.code,'| reason:',e.reason,'| wasClean:',e.wasClean);
+      console.log('[WS] Closed | code:',e.code,'| wasClean:',e.wasClean);
       if(S.connected){
-        // Was connected, lost connection — try to reconnect
-        S.connected=false;
-        _setStatus('disconnected');
-        _toast('Connection lost','Reconnecting to Deriv...','i');
+        S.connected=false;_setStatus('disconnected');
+        _toast('Connection lost','Reconnecting to Deriv...','i',3000);
         _schedReconn();
-      } else if(token && !S._authFailed){
-        // Connection closed before auth — try next endpoint
+      }else if(token&&!S._authFailed){
         wsIdx++;
-        if(wsIdx<WS_ENDPOINTS.length){
-          console.log('[WS] Trying next endpoint...');
-          setTimeout(function(){_open();},1500);
-        } else {
-          wsIdx=0;
-          _schedReconn();
-        }
-      } else {
-        // Auth failed — don't reconnect, show error
-        _setStatus('disconnected');
-      }
+        if(wsIdx<WS_ENDPOINTS.length){console.log('[WS] Trying next endpoint');setTimeout(function(){_open();},1500);}
+        else{wsIdx=0;_schedReconn();}
+      }else{_setStatus('disconnected');}
     };
   }
 
   function _schedReconn(){
-    if(reconnAttempts>=8){_toast('Failed','Could not reconnect. Refresh page.','e');_setStatus('disconnected');return;}
+    if(reconnAttempts>=8){_toast('Reconnect Failed','Refresh the page to try again.','e');_setStatus('disconnected');return;}
     var d=Math.min(3000*Math.pow(1.5,reconnAttempts),30000);
     reconnAttempts++;wsIdx=0;_setStatus('connecting');
     clearTimeout(reconnTimer);
@@ -969,50 +956,53 @@ var API = (function(){
   function _handle(msg){
     if(msg.req_id&&pending[msg.req_id]){var cb=pending[msg.req_id];delete pending[msg.req_id];cb(msg);}
     var t=msg.msg_type;
+
     if(t==='tick'){
-      var tick=msg.tick;
-      var p=parseFloat(tick.quote);
+      var tick=msg.tick;var p=parseFloat(tick.quote);
       tickPrices[tick.symbol]=p;
       (tickSubs[tick.symbol]||[]).forEach(function(fn){fn({symbol:tick.symbol,price:p,epoch:tick.epoch});});
       Ticker.onTick(tick.symbol,p);
     }
-    if(t==='proposal_open_contract'&&msg.proposal_open_contract)Trader.onContractUpdate(msg.proposal_open_contract);
-    if(t==='balance'&&msg.balance){
-      // This is the authoritative balance from Deriv's server
-      // Always trust this over any local calculation
-      var derivBal=parseFloat(String(msg.balance.balance).replace(/,/g,''));
-      console.log('[API] Balance stream from Deriv:',derivBal,msg.balance.currency);
-      S.balance=derivBal;
-      S.currency=msg.balance.currency||S.currency;
-      _updateBal();
-      _updateMetrics();
+
+    if(t==='proposal_open_contract'&&msg.proposal_open_contract){
+      Trader.onContractUpdate(msg.proposal_open_contract);
     }
+
+    // ── BALANCE: always trust Deriv's stream — single source of truth ──
+    if(t==='balance'&&msg.balance){
+      var newBal=parseFloat(String(msg.balance.balance).replace(/,/g,''));
+      var newCur=msg.balance.currency||S.currency;
+      console.log('[API] Balance update from Deriv:',newBal,newCur,'(was:'+S.balance+')');
+      S.balance=newBal;S.currency=newCur;
+      _updateBal();_updateMetrics();
+    }
+
+    // ── TRANSACTION: every buy/sell sends updated balance ──
     if(t==='transaction'&&msg.transaction){
       var tx=msg.transaction;
-      console.log('[API] Transaction:',tx.action,'amount:',tx.amount,'balance:',tx.balance,'loginid:',tx.loginid);
+      console.log('[API] Transaction | action:',tx.action,'| amount:',tx.amount,'| balance:',tx.balance,'| contract:',tx.contract_id);
       if(tx.action==='buy'){
         S.activeTrades++;
-        // Deriv sends the new balance after every transaction
         if(tx.balance!=null){
           var buyBal=parseFloat(String(tx.balance).replace(/,/g,''));
-          console.log('[API] Balance after buy:',buyBal);
+          console.log('[API] Balance after buy from Deriv:',buyBal);
           S.balance=buyBal;
         }
         _updateMetrics();_updateBal();
       }
       if(tx.action==='sell'){
         S.activeTrades=Math.max(0,S.activeTrades-1);
-        var pp=parseFloat(tx.amount||0);
+        var profit=parseFloat(tx.amount||0);
         if(tx.balance!=null){
           var sellBal=parseFloat(String(tx.balance).replace(/,/g,''));
-          console.log('[API] Balance after sell:',sellBal,'profit:',pp);
+          console.log('[API] Balance after sell from Deriv:',sellBal,'profit:',profit);
           S.balance=sellBal;
         }
-        if(pp>0){S.wins++;S.todayPnl=parseFloat((S.todayPnl+pp).toFixed(2));}
-        else{S.losses++;S.todayPnl=parseFloat((S.todayPnl+pp).toFixed(2));}
+        if(profit>0){S.wins++;S.todayPnl=parseFloat((S.todayPnl+profit).toFixed(2));}
+        else{S.losses++;S.todayPnl=parseFloat((S.todayPnl+profit).toFixed(2));}
         _updateMetrics();_updateBal();
-        // Request fresh balance 2 seconds after sell to confirm
-        setTimeout(function(){if(S.connected&&S.accountType==='real')API.requestFreshBalance();},2000);
+        // Confirm balance 2s after sell on real account
+        if(S.accountType==='real'){setTimeout(function(){requestFreshBalance();},2000);}
       }
     }
   }
@@ -1032,7 +1022,6 @@ var API = (function(){
     if(tickSubs[sym].indexOf(cb)<0)tickSubs[sym].push(cb);
     if(tickPrices[sym]===undefined)_send({ticks:sym,subscribe:1});
   }
-
   function getTickHist(sym,count){
     count=count||300;
     return new Promise(function(res,rej){
@@ -1042,7 +1031,6 @@ var API = (function(){
       });
     });
   }
-
   function getCandleHist(sym,gran,count){
     gran=gran||60;count=count||100;
     return new Promise(function(res,rej){
@@ -1052,54 +1040,61 @@ var API = (function(){
       });
     });
   }
-
   function getProposal(p){
     return new Promise(function(res,rej){
       var pl={proposal:1,amount:p.stake,basis:'stake',contract_type:p.contractType,currency:S.currency||'USD',symbol:p.symbol};
       if(p.duration&&p.durationUnit){pl.duration=p.duration;pl.duration_unit=p.durationUnit;}
       if(p.barrier!=null)pl.barrier=String(p.barrier);
       if(p.growthRate)pl.growth_rate=p.growthRate;
-      _send(pl,function(r){if(r.error){rej(r.error);return;}res(r.proposal);});
+      console.log('[API] Proposal request:',JSON.stringify(pl));
+      _send(pl,function(r){
+        if(r.error){
+          console.error('[API] Proposal error:',r.error.code,r.error.message);
+          rej(r.error);return;
+        }
+        console.log('[API] Proposal OK | id:'+r.proposal.id+' | ask:'+r.proposal.ask_price+' | payout:'+r.proposal.payout);
+        res(r.proposal);
+      });
     });
   }
-
   function buyContract(id,price){
     return new Promise(function(res,rej){
+      console.log('[API] Buy contract | proposal_id:'+id+' | price:'+price);
       _send({buy:id,price:price},function(r){
-        if(r.error){rej(r.error);return;}
+        if(r.error){
+          console.error('[API] Buy error:',r.error.code,r.error.message);
+          rej(r.error);return;
+        }
+        console.log('[API] Buy OK | contract_id:'+r.buy.contract_id+' | buy_price:'+r.buy.buy_price+' | payout:'+r.buy.payout);
         _send({proposal_open_contract:1,contract_id:r.buy.contract_id,subscribe:1});
         res(r.buy);
       });
     });
   }
-
   function getProfitTable(limit){
     limit=limit||50;
     return new Promise(function(res){
       _send({profit_table:1,limit:limit,sort:'DESC'},function(r){res(r.error?[]:(r.profit_table.transactions||[]));});
     });
   }
-
   function getPrice(sym){return tickPrices[sym]||null;}
-
-  // Request fresh balance from Deriv — call after trade settlement on real accounts
   function requestFreshBalance(){
     if(!ws||ws.readyState!==1)return;
     _send({balance:1},function(br){
       if(!br.error&&br.balance){
-        var newBal=parseFloat(String(br.balance.balance).replace(/,/g,''));
-        console.log('[API] Fresh balance from Deriv:',newBal,br.balance.currency);
-        S.balance=newBal;
-        S.currency=br.balance.currency||S.currency;
-        _updateBal();
-        _updateMetrics();
+        var b=parseFloat(String(br.balance.balance).replace(/,/g,''));
+        console.log('[API] Fresh balance from Deriv:',b,br.balance.currency);
+        S.balance=b;S.currency=br.balance.currency||S.currency;
+        _updateBal();_updateMetrics();
       }
     });
   }
 
-  return{connect:connect,disconnect:disconnect,subTick:subTick,getTickHist:getTickHist,
-    getCandleHist:getCandleHist,getProposal:getProposal,buyContract:buyContract,
-    getProfitTable:getProfitTable,getPrice:getPrice,requestFreshBalance:requestFreshBalance};
+  return{connect:connect,disconnect:disconnect,subTick:subTick,
+    getTickHist:getTickHist,getCandleHist:getCandleHist,
+    getProposal:getProposal,buyContract:buyContract,
+    getProfitTable:getProfitTable,getPrice:getPrice,
+    requestFreshBalance:requestFreshBalance};
 })();
 
 // ── Ticker ────────────────────────────────────────────────
@@ -1499,64 +1494,43 @@ function _feedUpdate(entry){
 
 // ── Trader ────────────────────────────────────────────────
 var Trader = (function(){
-  function onContractUpdate(c){
+function onContractUpdate(c){
     var entry=S.openContracts[c.contract_id];if(!entry)return;
-
-    // Always update current profit display while trade is open
-    if(!c.is_sold && c.status!=='sold' && c.profit!==undefined){
-      entry.currentProfit = parseFloat(c.profit||0);
+    // Update current profit while trade is still open
+    if(!c.is_sold&&c.status!=='sold'){
+      if(c.profit!==undefined)entry.currentProfit=parseFloat(c.profit||0);
       return;
     }
-
-    if(c.is_sold||c.status==='sold'){
-      var p=parseFloat(c.profit);var won=p>0;
-      entry.status='closed';entry.won=won;entry.pnl=p;entry.closeTime=Date.now();
-      S.activeTrades=Math.max(0,S.activeTrades-1);
-
-      // Update P&L tracking
-      S.todayPnl = parseFloat((S.todayPnl + p).toFixed(2));
-      if(won){
-        S.wins++;
-        S.streak = S.streakType==='win' ? S.streak+1 : 1;
-        S.streakType='win';
-      } else {
-        S.losses++;
-        S.streak = S.streakType==='loss' ? S.streak+1 : 1;
-        S.streakType='loss';
-      }
-
-      // For real accounts: balance is updated by the 'balance' subscription stream
-      // which Deriv pushes automatically after every settled contract.
-      // For demo/sim: update locally.
-      if(entry.simulated){
-        S.balance = parseFloat((S.balance + p).toFixed(2));
-      }
-      // For real accounts, trust the balance subscription (handled in _handle)
-      // but also request a fresh balance to be sure
-      if(!entry.simulated && S.connected){
-        // Request fresh balance from Deriv to ensure sync
-        setTimeout(function(){
-          API.requestFreshBalance();
-        }, 1500);
-      }
-
-      delete S.openContracts[c.contract_id];
-      _updateMetrics();
-      _feedUpdate(entry);
-
-      // Show result toast
-      if(won){
-        _toast('WIN! +$'+p.toFixed(2),
-          (entry.real?'REAL':'Demo')+' '+entry.contractType+' on '+(SYMS[entry.symbol]||entry.symbol),
-          's',6000);
-      } else {
-        _toast('Loss -$'+Math.abs(p).toFixed(2),
-          (entry.real?'REAL':'Demo')+' '+entry.contractType+' on '+(SYMS[entry.symbol]||entry.symbol),
-          'e',5000);
-      }
-
-      if(entry._resolve)entry._resolve({won:won,pnl:p,stake:entry.stake});
+    // ── Trade settled ─────────────────────────────────────
+    var profit=parseFloat(c.profit);
+    var won=profit>0;
+    entry.status='closed';entry.won=won;entry.pnl=profit;entry.closeTime=Date.now();
+    S.activeTrades=Math.max(0,S.activeTrades-1);
+    // Track P&L
+    S.todayPnl=parseFloat((S.todayPnl+profit).toFixed(2));
+    if(won){S.wins++;S.streak=S.streakType==='win'?S.streak+1:1;S.streakType='win';}
+    else{S.losses++;S.streak=S.streakType==='loss'?S.streak+1:1;S.streakType='loss';}
+    // For real trades: balance comes from the 'balance' stream and 'transaction' stream
+    // Deriv pushes these automatically — we trust them over local calculation
+    // For simulated trades only: update balance locally
+    if(entry.simulated){
+      S.balance=parseFloat((S.balance+profit).toFixed(2));
     }
+    // Always request fresh balance after real trade settles to confirm sync
+    if(!entry.simulated&&S.connected){
+      setTimeout(function(){API.requestFreshBalance();},1500);
+      setTimeout(function(){API.requestFreshBalance();},4000);
+    }
+    console.log('[Trade] Settled | contract:',c.contract_id,'| profit:',profit,'| real:',!entry.simulated,'| balance after:',S.balance);
+    delete S.openContracts[c.contract_id];
+    _updateMetrics();_feedUpdate(entry);
+    if(won){
+      _toast('WIN! +$'+profit.toFixed(2),(entry.real?'REAL':'Demo')+' '+entry.contractType+' on '+(SYMS[entry.symbol]||entry.symbol)+' | Balance: '+S.currency+' '+S.balance.toFixed(2),'s',6000);
+    }else{
+      _toast('Loss -$'+Math.abs(profit).toFixed(2),(entry.real?'REAL':'Demo')+' '+entry.contractType+' on '+(SYMS[entry.symbol]||entry.symbol)+' | Balance: '+S.currency+' '+S.balance.toFixed(2),'e',5000);
+    }
+    if(entry._resolve)entry._resolve({won:won,pnl:profit,stake:entry.stake});
+  }
   }
 
   function _sim(params,source){
@@ -1582,31 +1556,23 @@ var Trader = (function(){
     });
   }
 
-  function executeTrade(params,source){
+ function executeTrade(params,source){
     source=source||'manual';
     if(!S.connected)return Promise.reject(new Error('Not connected'));
     if(S.activeTrades>=MAX_TRADES)return Promise.reject(new Error('Max active trades reached'));
+    var isReal=S.accountType==='real';
 
-    // Determine if this is a real account — never silently simulate real trades
-    var isReal = S.accountType === 'real';
-
+    // ── For real accounts: execute only via Deriv API — never simulate ──
+    // ── For demo accounts: try API first, fall back to simulation ────────
     return API.getProposal(params).then(function(proposal){
       if(!proposal||!proposal.id){
         if(isReal){
-          var errMsg='Proposal failed — trade NOT placed on real account';
-          _toast('Trade Failed',errMsg,'e',6000);
-          return Promise.reject(new Error(errMsg));
+          return Promise.reject(new Error('Proposal failed — real trade NOT placed'));
         }
-        console.log('[Trade] Demo sim (no proposal)');
         return _sim(params,source);
       }
-
-      // Log the proposal for transparency
-      console.log('[Trade] Proposal OK — id:'+proposal.id+' ask:'+proposal.ask_price+' payout:'+proposal.payout);
-      _toast('Placing trade...','Sending to Deriv: '+params.contractType+' $'+params.stake,'i',2000);
-
+      _toast('Placing trade...','Sending to Deriv: '+params.contractType+' on '+(SYMS[params.symbol]||params.symbol)+' $'+params.stake,'i',2000);
       return API.buyContract(proposal.id,proposal.ask_price).then(function(buy){
-        console.log('[Trade] BUY OK — contract_id:'+buy.contract_id+' buy_price:'+buy.buy_price);
         S.activeTrades++;
         var entry={
           id:buy.contract_id,
@@ -1614,33 +1580,26 @@ var Trader = (function(){
           symbol:params.symbol,
           stake:parseFloat(buy.buy_price),
           payout:parseFloat(buy.payout),
-          status:'open',source:source,
-          openTime:Date.now(),pnl:null,won:null,
-          real: isReal,
+          status:'open',
+          source:source,
+          openTime:Date.now(),
+          pnl:null,won:null,
+          real:isReal,
+          simulated:false,
         };
         S.openContracts[buy.contract_id]=entry;
         S.tradeHistory.unshift(entry);
         _updateMetrics();_feedAdd(entry);
-        _toast('Trade Placed!',
-          (isReal?'REAL':'Demo')+' '+params.contractType+' on '+(SYMS[params.symbol]||params.symbol)+' $'+params.stake,
-          'i',3000);
+        console.log('[Trade] Placed on Deriv | contract:',buy.contract_id,'| buy_price:',buy.buy_price,'| payout:',buy.payout,'| real:',isReal);
         return new Promise(function(res){entry._resolve=res;});
       }).catch(function(e){
-        console.error('[Trade] BUY FAILED:',e.message);
-        if(isReal){
-          _toast('Buy Failed',e.message+' — no real trade placed','e',8000);
-          return Promise.reject(e);
-        }
-        console.log('[Trade] Demo sim fallback after buy error');
+        console.error('[Trade] Buy failed:',e.message);
+        if(isReal){return Promise.reject(new Error('Buy failed on real account: '+e.message));}
         return _sim(params,source);
       });
     }).catch(function(e){
-      console.error('[Trade] PROPOSAL FAILED:',e.message);
-      if(isReal){
-        _toast('Proposal Failed',e.message+' — no real trade placed','e',8000);
-        return Promise.reject(e);
-      }
-      console.log('[Trade] Demo sim fallback after proposal error');
+      console.error('[Trade] Proposal failed:',e.message);
+      if(isReal){return Promise.reject(new Error('Proposal failed on real account: '+e.message));}
       return _sim(params,source);
     });
   }
