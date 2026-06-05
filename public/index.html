@@ -1430,19 +1430,51 @@ var AE = (function(){
       patterns:[],bullScore:50,bearScore:50,timestamp:Date.now()};
   }
 
-  function quick(sym){return analyse(sym).catch(function(e){return _mock(sym,e.message);});}
+function quick(sym){return analyse(sym).catch(function(e){return _mock(sym,e.message);});}
 
-  function warmup(){
-    console.log('[AE] warming up',ALL_SCAN_SYMS.length,'symbols');
-    ALL_SCAN_SYMS.forEach(function(s,i){setTimeout(function(){_sub(s);},i*100);});
-    setTimeout(function(){
-      ['1HZ50V','1HZ75V','1HZ25V','BOOM500','CRASH500','frxEURUSD','frxXAUUSD'].forEach(function(s,i){
-        setTimeout(function(){_load(s).catch(function(){});},i*500);
-      });
-    },5000);
+  // Pre-fetch latest analysis for a symbol and cache it
+  // Returns cached result if fresh enough (< 8 seconds old)
+  var _quickCache = {};
+  function quickCached(sym){
+    var now = Date.now();
+    var cached = _quickCache[sym];
+    if(cached && (now - cached.timestamp) < 8000){
+      return Promise.resolve(cached);
+    }
+    return analyse(sym).then(function(r){
+      _quickCache[sym] = r;
+      return r;
+    }).catch(function(e){ return _mock(sym,e.message); });
   }
 
-  return{analyse:analyse,quick:quick,warmup:warmup,ALL_SCAN_SYMS:ALL_SCAN_SYMS,_cache:_cache,_load:_load};
+  function warmup(){
+    console.log('[AE] Warming up all',ALL_SCAN_SYMS.length,'symbols...');
+    // Subscribe live ticks for ALL symbols immediately
+    ALL_SCAN_SYMS.forEach(function(s,i){
+      setTimeout(function(){ _sub(s); }, i * 80);
+    });
+    // Pre-load tick history for priority symbols immediately
+    var priority = [
+      '1HZ50V','1HZ75V','1HZ25V','1HZ100V',
+      'BOOM500','CRASH500','frxEURUSD','frxGBPUSD',
+      'frxXAUUSD','JD100','R_50','BOOM1000'
+    ];
+    setTimeout(function(){
+      priority.forEach(function(s,i){
+        setTimeout(function(){ _load(s).catch(function(){}); }, i * 300);
+      });
+    }, 2000);
+    // Load remaining symbols after 15 seconds
+    setTimeout(function(){
+      ALL_SCAN_SYMS.forEach(function(s,i){
+        if(priority.indexOf(s) < 0){
+          setTimeout(function(){ _load(s).catch(function(){}); }, i * 200);
+        }
+      });
+    }, 15000);
+  }
+
+  return{analyse:analyse,quick:quick,quickCached:quickCached,warmup:warmup,ALL_SCAN_SYMS:ALL_SCAN_SYMS,_cache:_cache,_load:_load};
 })();
 
 // ── Trade Feed ────────────────────────────────────────────
@@ -1634,78 +1666,276 @@ var Trader = (function(){
     }
   }
 
+ // ── Market scoring weights for profit-first selection ──
+  var MARKET_SCORES = {}; // tracks per-symbol win history
+  var SCAN_INTERVAL = 1500; // ms between scans — fast continuous loop
+
   function _startLoop(){
-    clearTimeout(S.autoTimer);S._loopRunning=false;
-    _toast('Scanning Markets...','Analysing all markets - will execute when favourable','i');
+    clearTimeout(S.autoTimer);
+    clearInterval(S.autoInterval);
+    S._loopRunning = false;
+    S._scanCycle = 0;
+    _toast('Auto-Trading ON','Scanning all '+AE.ALL_SCAN_SYMS.length+' markets continuously...','s',4000);
+    console.log('[Loop] Starting continuous scan loop on',AE.ALL_SCAN_SYMS.length,'markets');
+
     function tick(){
-      if(!S.autoTrade){S._loopRunning=false;return;}
-      if(!S.connected){S.autoTimer=setTimeout(tick,3000);return;}
-      S._loopRunning=true;
-      var tp=parseFloat($('cfgTP')?$('cfgTP').value:'0')||0;
-      var sl=parseFloat($('cfgSL')?$('cfgSL').value:'0')||0;
-      if(tp>0&&S.todayPnl>=tp){toggleAuto();_toast('Take Profit!','+$'+S.todayPnl.toFixed(2)+' reached','s');return;}
-      if(sl>0&&S.todayPnl<=-sl){toggleAuto();Bots.stopAll();_toast('Stop Loss!','-$'+Math.abs(S.todayPnl).toFixed(2)+' reached','e');return;}
-      if(S.activeTrades>=MAX_TRADES){S.autoTimer=setTimeout(tick,3000);return;}
-      var rule=_getRule();
-      var p=rule?_execRule(rule).catch(function(e){console.warn('[Rule]',e.message);}):_autoTrade().catch(function(e){console.warn('[AutoTrade]',e.message);});
-      p.then(function(){
-        if(S.autoTrade){var d=S.activeTrades>0?4000:2000;S.autoTimer=setTimeout(tick,d);}
+      if(!S.autoTrade){ S._loopRunning=false; console.log('[Loop] Stopped'); return; }
+      if(!S.connected){ S.autoTimer=setTimeout(tick,2000); return; }
+      S._loopRunning = true;
+      S._scanCycle = (S._scanCycle||0) + 1;
+
+      // ── Daily limit guards ──────────────────────────────
+      var tp = parseFloat(($('cfgTP')&&$('cfgTP').value)||'0')||0;
+      var sl = parseFloat(($('cfgSL')&&$('cfgSL').value)||'0')||0;
+      if(tp>0 && S.todayPnl>=tp){
+        toggleAuto();
+        _toast('Daily Target Hit!','Take profit $'+tp+' reached — auto-trading stopped','s',8000);
+        return;
+      }
+      if(sl>0 && S.todayPnl<=-sl){
+        toggleAuto(); Bots.stopAll();
+        _toast('Daily Loss Limit!','Stop loss -$'+sl+' reached — all trading stopped','e',8000);
+        return;
+      }
+
+      // ── Max concurrent trades guard ─────────────────────
+      if(S.activeTrades >= MAX_TRADES){
+        S.autoTimer = setTimeout(tick, 1500);
+        return;
+      }
+
+      // ── Check manual rules first ────────────────────────
+      var rule = _getRule();
+      if(rule){
+        _execRule(rule).catch(function(e){ console.warn('[Rule]',e.message); }).then(function(){
+          if(S.autoTrade) S.autoTimer = setTimeout(tick, SCAN_INTERVAL);
+        });
+        return;
+      }
+
+      // ── Run continuous market scan ──────────────────────
+      _autoTrade().catch(function(e){
+        console.warn('[AutoTrade]',e.message);
+      }).then(function(){
+        if(S.autoTrade){
+          // Reschedule immediately — no long wait
+          var delay = S.activeTrades > 0 ? 2000 : SCAN_INTERVAL;
+          S.autoTimer = setTimeout(tick, delay);
+        }
       });
     }
+
+    // Start IMMEDIATELY — first scan right away
     tick();
   }
 
-  function _autoTrade(){
-    var thresh=parseInt($('cfgConf')?$('cfgConf').value:'62')||62;
-    var stake=parseFloat($('cfgStake')?$('cfgStake').value:'1')||1;
-    var scanList=AE.ALL_SCAN_SYMS;
-    console.log('[AutoTrade] scanning',scanList.length,'markets threshold:',thresh+'%');
-    var BATCH=8,allR=[],idx=0;
-    function nextBatch(){
-      if(idx>=scanList.length){
-        return Promise.resolve(allR);
-      }
-      var batch=scanList.slice(idx,idx+BATCH);idx+=BATCH;
-      return Promise.all(batch.map(function(s){return AE.quick(s).catch(function(){return null;});}))
-        .then(function(res){
-          res.forEach(function(r){if(r)allR.push(r);});
-          return new Promise(function(resolve){setTimeout(function(){resolve(nextBatch());},250);});
-        });
-    }
-    return nextBatch().then(function(results){
-      console.log('[AutoTrade] scanned',results.length,'finding best signal...');
-      var valid=results.filter(function(a){return a&&a.direction!=='NEUTRAL'&&a.confidence>=thresh&&a.currentPrice>0;});
-      valid.sort(function(a,b){
-        var pw=function(p){return p==='HIGH'?1.3:p==='MEDIUM'?1.1:1;};
-        return(b.confidence*pw(b.projectedProfit))-(a.confidence*pw(a.projectedProfit));
+function _autoTrade(){
+    var thresh = parseInt(($('cfgConf')&&$('cfgConf').value)||'62')||62;
+    var stake  = parseFloat(($('cfgStake')&&$('cfgStake').value)||'1')||1;
+    var scanList = AE.ALL_SCAN_SYMS;
+
+    // ── Scan all markets in small fast batches ──────────
+    var BATCH = 6;
+    var allResults = [];
+    var batchIdx = 0;
+
+    function runBatch(){
+      if(batchIdx >= scanList.length) return Promise.resolve(allResults);
+      var batch = scanList.slice(batchIdx, batchIdx + BATCH);
+      batchIdx += BATCH;
+     return Promise.all(batch.map(function(sym){
+        return AE.quickCached(sym).catch(function(){ return null; });
+      })).then(function(res){
+        res.forEach(function(r){ if(r && r.currentPrice > 0) allResults.push(r); });
+        // Small gap between batches to avoid WS flood
+        return new Promise(function(resolve){ setTimeout(function(){ resolve(runBatch()); }, 80); });
       });
-      if(!valid.length){
-        console.log('[AutoTrade] no signals >= threshold',thresh);
-        _toast('Scanning...','No qualifying signal across '+results.length+' markets - rescanning','i',2500);
+    }
+
+    return runBatch().then(function(){
+      console.log('[AutoTrade] Cycle #'+S._scanCycle+' | Scanned:',allResults.length,'| Threshold:',thresh+'%');
+
+      // ── Filter: must be clear direction + meet confidence ──
+      var candidates = allResults.filter(function(r){
+        return r.direction !== 'NEUTRAL'
+          && r.confidence >= thresh
+          && r.currentPrice > 0;
+      });
+
+      if(!candidates.length){
+        console.log('[AutoTrade] No qualifying signals at',thresh+'% — continuing scan...');
         return;
       }
-      var best=valid[0],sym=best.sym;
-      var ct=best.direction==='BUY'?'CALL':'PUT';
-      var is1s=sym.startsWith('1HZ')||sym.startsWith('R_')||sym==='stpRNG';
-      if(is1s&&best.indicators&&best.indicators.df){
-        var df=best.indicators.df;
-        if(df.strongEvenBias||(df.evenBias&&df.recentEvenBias))ct='DIGITEVEN';
-        else if(df.strongOddBias||(df.oddBias&&df.recentOddBias))ct='DIGITODD';
-        else if(df.overBias)ct='DIGITOVER';
-        else if(df.underBias)ct='DIGITUNDER';
+
+      // ── Advanced profit-first scoring ────────────────────
+      // Score combines: confidence, trend alignment, MACD alignment,
+      // projected profit, digit bias strength, and historical win rate
+      candidates.forEach(function(r){
+        var score = r.confidence;
+
+        // Bonus: projected profit rating
+        if(r.projectedProfit === 'HIGH')   score += 15;
+        if(r.projectedProfit === 'MEDIUM') score += 7;
+
+        // Bonus: trend and direction aligned
+        var trend = r.indicators && r.indicators.trend;
+        if(trend){
+          if(r.direction==='BUY'  && trend.direction==='uptrend')   score += 10;
+          if(r.direction==='SELL' && trend.direction==='downtrend')  score += 10;
+          score += Math.min(trend.strength||0, 20) * 0.3;
+        }
+
+        // Bonus: MACD confirms direction
+        var macd = r.indicators && r.indicators.macd;
+        if(macd){
+          if(r.direction==='BUY'  && macd.bullish)  score += 8;
+          if(r.direction==='SELL' && !macd.bullish) score += 8;
+          if(macd.crossUp   && r.direction==='BUY')  score += 12;
+          if(macd.crossDown && r.direction==='SELL') score += 12;
+        }
+
+        // Bonus: RSI in favourable zone
+        var rsi = r.indicators && r.indicators.rsi;
+        if(rsi !== null && rsi !== undefined){
+          if(r.direction==='BUY'  && rsi < 35)  score += 10;
+          if(r.direction==='BUY'  && rsi < 45)  score += 5;
+          if(r.direction==='SELL' && rsi > 65)  score += 10;
+          if(r.direction==='SELL' && rsi > 55)  score += 5;
+        }
+
+        // Bonus: Bollinger band confirmation
+        var bb = r.indicators && r.indicators.bb;
+        if(bb){
+          if(r.direction==='BUY'  && bb.belowLower)  score += 12;
+          if(r.direction==='BUY'  && bb.nearLower)   score += 6;
+          if(r.direction==='SELL' && bb.aboveUpper)  score += 12;
+          if(r.direction==='SELL' && bb.nearUpper)   score += 6;
+        }
+
+        // Bonus: Stochastic crossover in extreme zone
+        var stoch = r.indicators && r.indicators.stoch;
+        if(stoch){
+          if(r.direction==='BUY'  && stoch.oversold  && stoch.crossUp)   score += 10;
+          if(r.direction==='SELL' && stoch.overbought && stoch.crossDown) score += 10;
+        }
+
+        // Bonus: Digit frequency strong bias for synthetics
+        var df = r.indicators && r.indicators.df;
+        if(df){
+          if(df.strongEvenBias || df.strongOddBias) score += 8;
+          if(df.recentEvenBias || df.recentOddBias) score += 5;
+        }
+
+        // Penalty: MTF not aligned
+        if(!r.mtfAligned) score -= 8;
+
+        // Penalty: weak projected profit
+        if(r.projectedProfit === 'LOW') score -= 10;
+
+        // Historical win rate bonus for this symbol
+        var symHistory = MARKET_SCORES[r.sym];
+        if(symHistory && symHistory.total >= 3){
+          var wr = symHistory.wins / symHistory.total;
+          if(wr >= 0.7) score += 12;
+          else if(wr >= 0.6) score += 6;
+          else if(wr < 0.4) score -= 15; // avoid consistently losing markets
+        }
+
+        r._score = Math.round(score);
+      });
+
+      // ── Sort by composite score (highest first) ──────────
+      candidates.sort(function(a,b){ return b._score - a._score; });
+
+      // Log top 3 candidates
+      console.log('[AutoTrade] Top signals:');
+      candidates.slice(0,3).forEach(function(r){
+        console.log('  ',r.sym, r.direction, r.confidence+'%',
+          'score:'+r._score, 'proj:'+r.projectedProfit,
+          'rsi:'+(r.indicators&&r.indicators.rsi||'n/a'));
+      });
+
+      // ── Pick the best signal ─────────────────────────────
+      var best = candidates[0];
+
+      // Only trade if the composite score clears a high bar
+      var minScore = thresh + 10;
+      if(best._score < minScore){
+        console.log('[AutoTrade] Best score',best._score,'< min',minScore,'— waiting for stronger signal');
+        return;
       }
-      var isFx=sym.startsWith('frx')||sym.startsWith('cry')||sym.startsWith('OTC');
-      var durU=isFx?'m':'t',dur=5;
-      var barrier=ct==='DIGITOVER'?4:ct==='DIGITUNDER'?5:null;
-      console.log('[AutoTrade] EXECUTING',sym,ct,'conf:',best.confidence+'%','proj:',best.projectedProfit);
-      _toast(N(sym)+' > '+ct,'Conf: '+best.confidence+'% | '+best.projectedProfit+' | $'+stake,'i',3000);
-      if(!S.connected||S.activeTrades>=MAX_TRADES)return;
-      var params={symbol:sym,contractType:ct,stake:stake,duration:dur,durationUnit:durU,barrier:barrier,growthRate:null,_conf:best.confidence,_autoMode:true};
+
+      var sym = best.sym;
+
+      // ── Determine exact contract type ────────────────────
+      var ct = best.direction === 'BUY' ? 'CALL' : 'PUT';
+
+      // Synthetics (1s): use digit contracts when digit bias is strong
+      var is1s = sym.startsWith('1HZ') || sym.startsWith('R_') || sym==='stpRNG';
+      if(is1s && best.indicators && best.indicators.df){
+        var df = best.indicators.df;
+        // Only use digits when there is a STRONG statistical bias
+        if(df.strongEvenBias && df.recentEvenBias)        ct = 'DIGITEVEN';
+        else if(df.strongOddBias && df.recentOddBias)     ct = 'DIGITODD';
+        else if(df.overBias  && df.overPct  > 60)         { ct = 'DIGITOVER';  }
+        else if(df.underBias && df.underPct > 60)         { ct = 'DIGITUNDER'; }
+        // Fall back to CALL/PUT if digit bias is weak
+      }
+
+      // Duration — ticks for synthetics, minutes for forex/indices
+      var isFx = sym.startsWith('frx')||sym.startsWith('cry')||sym.startsWith('OTC');
+      var durU = isFx ? 'm' : 't';
+      var dur  = 5;
+      var barrier = ct==='DIGITOVER'?4:ct==='DIGITUNDER'?5:null;
+
+      console.log('[AutoTrade] EXECUTING:',sym,ct,
+        '| conf:'+best.confidence+'% score:'+best._score,
+        '| proj:'+best.projectedProfit,
+        '| stake:$'+stake);
+
+      _toast(
+        (SYMS[sym]||sym)+' \u2192 '+ct,
+        'Conf: '+best.confidence+'% | Score: '+best._score+' | $'+stake,
+        'i', 2500
+      );
+
+      if(!S.connected || S.activeTrades >= MAX_TRADES) return;
+
+      var params = {
+        symbol:sym, contractType:ct, stake:stake,
+        duration:dur, durationUnit:durU,
+        barrier:barrier, growthRate:null,
+        _conf:best.confidence, _autoMode:true,
+      };
+
       return executeTrade(params,'AUTO').then(function(r){
-        if(r.won){_toast('AUTO WIN +$'+r.pnl.toFixed(2),N(sym)+' - '+ct+' | Bal: '+S.currency+' '+S.balance.toFixed(2),'s',5000);}
-        else{_toast('AUTO LOSS -$'+stake,N(sym)+' - '+ct+' | Bal: '+S.currency+' '+S.balance.toFixed(2),'e',5000);}
-        _updateMetrics();_updateBal();
-      }).catch(function(e){console.error('[AutoTrade error]',e.message);});
+        // ── Update per-symbol win history ─────────────────
+        if(!MARKET_SCORES[sym]) MARKET_SCORES[sym]={wins:0,losses:0,total:0};
+        MARKET_SCORES[sym].total++;
+        if(r.won){
+          MARKET_SCORES[sym].wins++;
+          _toast(
+            'WIN +$'+r.pnl.toFixed(2),
+            (SYMS[sym]||sym)+' \u2014 '+ct+
+            ' | P&L today: '+(S.todayPnl>=0?'+':'')+S.todayPnl.toFixed(2),
+            's', 5000
+          );
+        } else {
+          MARKET_SCORES[sym].losses++;
+          _toast(
+            'Loss -$'+stake,
+            (SYMS[sym]||sym)+' \u2014 '+ct+
+            ' | P&L today: '+(S.todayPnl>=0?'+':'')+S.todayPnl.toFixed(2),
+            'e', 4000
+          );
+        }
+        _updateMetrics(); _updateBal();
+      }).catch(function(e){
+        console.error('[AutoTrade] Execution error:',e.message);
+        if(e.message && e.message.indexOf('real account')>=0){
+          _toast('Trade Error',e.message,'e',8000);
+        }
+      });
     });
   }
 
