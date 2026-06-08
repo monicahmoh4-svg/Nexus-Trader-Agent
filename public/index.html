@@ -700,7 +700,7 @@ window.onerror = function(msg,src,line){
 
 // ── Config ────────────────────────────────────────────────
 // ── Deriv App ID ─────────────────────────────────────────
-// App ID 1089 is Deriv's official public app — works for all tokens.
+// App ID 1089 is Deriv's official public app -- works for all tokens.
 // To use your own App ID: go to https://developers.deriv.com,
 // register an app with Read + Trade scopes, then replace 1089 below.
 const DERIV_APP_ID = 1089;
@@ -774,28 +774,17 @@ function _setStatus(state){
 
 function _updateBal(){
   var isReal=S.accountType==='real';
-  // Format balance exactly as Deriv shows it
-  var bal=S.balance||0;
-  var cur=S.currency||'USD';
-  var balStr=cur+' '+bal.toFixed(2);
-  var lbl=isReal?'💰 REAL':'🧪 DEMO';
+  var lbl=isReal?'REAL':'DEMO';
   var cls=isReal?'real-m':'demo-m';
-  // Update every balance display element
-  var b=$('accBadge');if(b){b.textContent=lbl;b.className='acc-badge '+cls;}
+  var balStr=(S.currency||'USD')+' '+(S.balance||0).toFixed(2);
+  var b=$('accBadge');if(b){b.textContent=(isReal?'REAL':'DEMO');b.className='acc-badge '+cls;}
   var bl=$('balBadge');if(bl){bl.style.display='block';bl.textContent=balStr;}
-  var mBal=$('mBal');if(mBal){mBal.textContent=balStr;mBal.className='mval ac';}
+  var mBal=$('mBal');if(mBal)mBal.textContent=balStr;
   var sb=$('sBal');if(sb)sb.textContent=balStr;
   var sa=$('sAT');if(sa)sa.textContent=(isReal?'REAL':'DEMO')+' ACCOUNT';
-  var sl=$('sLID');if(sl)sl.textContent=S.loginid||'—';
+  var sl=$('sLID');if(sl)sl.textContent=S.loginid||'--';
   var st=$('stext');
-  if(st&&S.connected){
-    st.textContent=isReal?'🔴 REAL ACCOUNT LIVE':'🟢 DEMO LIVE';
-    st.className='stext '+(isReal?'real-live':'live');
-  }
-  // Keep header balance badge always visible when connected
-  var hBal=$('balBadge');
-  if(hBal&&S.connected){hBal.style.display='block';hBal.textContent=balStr;}
-  console.log('[UI] Balance displayed:',balStr,'| type:',S.accountType);
+  if(st&&S.connected){st.textContent=isReal?'REAL ACCOUNT LIVE':'DEMO LIVE';st.className='stext '+(isReal?'real-live':'live');}
 }
 
 function _updateMetrics(){
@@ -822,39 +811,46 @@ function _updateMetrics(){
 var API = (function(){
   var ws=null,token=null,reqId=1,pingInt=null,reconnTimer=null,reconnAttempts=0,wsIdx=0;
   var pending={},tickSubs={},tickPrices={};
-  var _balanceSubId=null;
 
   function connect(t,type){
     type=type||'demo';
-    token=(t||'').replace(/[\u200B-\u200D\uFEFF]/g,'').replace(/[\s]/g,'').replace(/^['"]+|['"]+$/g,'').trim();
-    if(!token||token.length<8){_toast('Invalid Token','Copy from app.deriv.com > Account Settings > API Token','e',7000);return;}
+    // Clean token: remove whitespace, BOM, zero-width chars, quotes only
+    token=(t||'').replace(/[\u200B-\u200D\uFEFF]/g,'') // zero-width
+                 .replace(/[\s]/g,'')                      // all whitespace
+                 .replace(/^['"]+|['"]+$/g,'')              // leading/trailing quotes
+                 .trim();
+    if(!token||token.length<8){
+      _toast('Invalid Token','Please copy your token from app.deriv.com > Account Settings > API Token','e',7000);
+      return;
+    }
+    console.log('[API] connect() called | type:',type,'| token length:',token.length,'| first 6 chars:',token.substring(0,6));
     S.accountType=type;S.connected=false;S.balance=0;S.currency='USD';
     S.loginid='';S.wins=0;S.losses=0;S.todayPnl=0;S.activeTrades=0;
-    S._authFailed=false;reconnAttempts=0;wsIdx=0;
-    console.log('[API] connect | type:',type,'| token[:6]:',token.substring(0,6));
-    _setStatus('connecting');_open();
+    S._authFailed=false;
+    reconnAttempts=0;wsIdx=0;
+    console.log('[API] connect type:',type,'token[:6]:',token.substring(0,6));
+    _setStatus('connecting');
+    _open();
   }
 
   function _open(){
     if(ws){try{ws.onopen=null;ws.onmessage=null;ws.onerror=null;ws.onclose=null;ws.close();}catch(e){}}
     ws=null;_setStatus('connecting');
     var ep=WS_ENDPOINTS[wsIdx%WS_ENDPOINTS.length];
-    console.log('[WS] Connecting to:',ep);
+    console.log('[WS] connecting to',ep);
     var connTimeout;
     try{ws=new WebSocket(ep);}
-    catch(e){_toast('Connection Error','Cannot open WebSocket. Check internet connection.','e');_setStatus('disconnected');return;}
+    catch(e){_toast('Connection Error','Cannot open WebSocket','e');_setStatus('disconnected');return;}
     connTimeout=setTimeout(function(){
       if(!ws||ws.readyState!==1){
-        console.warn('[WS] Timeout on',ep);
         wsIdx++;
-        if(wsIdx<WS_ENDPOINTS.length){_toast('Retrying...','Trying alternate Deriv server...','i',2000);_open();}
-        else{_toast('Cannot Connect','All Deriv servers unreachable. Check internet connection.','e',8000);_setStatus('disconnected');}
+        if(wsIdx<WS_ENDPOINTS.length){_toast('Retrying...','Trying alternate server','i');_open();}
+        else{_toast('Connection Failed','Cannot reach Deriv servers. Check your internet connection and try again.','e',8000);_setStatus('disconnected');}
       }
     },10000);
-
     ws.onopen=function(){
       clearTimeout(connTimeout);reconnAttempts=0;wsIdx=0;_startPing();
-      console.log('[WS] Connected — authorizing token...');
+      console.log('[WS] open - authorizing...');
       setTimeout(function(){
         _send({authorize:token},function(r){
           if(r.error){
@@ -862,82 +858,99 @@ var API = (function(){
             var msg=r.error.message||'Auth failed';
             var hint=msg;
             if(code==='InvalidToken'||msg.toLowerCase().indexOf('invalid token')>=0){
-              hint='Invalid token. Steps:\n1) Go to app.deriv.com\n2) Log into correct account (Demo or Real)\n3) Account Settings > API Token\n4) Create new token with READ + TRADE enabled\n5) Copy full token and paste here';
-            }else if(code==='DisabledClient'){hint='Deriv account is disabled. Contact Deriv support.';}
+              hint='Invalid token. Steps: 1) Go to app.deriv.com 2) Log into the correct account (Demo or Real) 3) Account Settings > API Token 4) Create new token with Read + Trade enabled 5) Copy the full token and paste here';
+            } else if(code==='DisabledClient'){
+              hint='Your Deriv account has been disabled. Contact Deriv support.';
+            } else if(msg.toLowerCase().indexOf('app')>=0){
+              hint='App ID error: '+msg+'. Try refreshing the page.';
+            }
+            console.error('[API] Auth error | code:',code,'| message:',msg);
             S._authFailed=true;
-            console.error('[API] Auth failed | code:',code,'| msg:',msg);
             _toast('Connection Failed',hint,'e',10000);
-            _setStatus('disconnected');token=null;return;
+            _setStatus('disconnected');
+            token=null;
+            return;
           }
           var a=r.authorize;
-          // Detect account type from Deriv response — is_virtual=1 means demo
           var isVirtual=a.is_virtual===1||a.is_virtual==='1'||a.is_virtual===true;
           S.accountType=isVirtual?'demo':'real';
-          // Parse balance exactly as Deriv sends it
-          S.balance=a.balance!=null?parseFloat(String(a.balance).replace(/,/g,''))||0:0;
+          var rawBal=a.balance;
+          S.balance=rawBal!=null?parseFloat(String(rawBal).replace(/,/g,''))||0:0;
           S.currency=a.currency||'USD';
           S.loginid=a.loginid||'';
           S.connected=true;S.activeTrades=0;
-          console.log('=== NEXUS TRADE CONNECTED ===');
-          console.log('LoginID:    ',S.loginid);
-          console.log('Account:    ',S.accountType,'(is_virtual='+a.is_virtual+')');
-          console.log('Balance:    ',S.balance,S.currency);
-          console.log('Real money: ',S.accountType==='real'?'YES — real funds':'NO — demo only');
-          console.log('=============================');
+          console.log('[API] auth OK:',S.loginid,'type:',S.accountType,'bal:',S.balance,S.currency);
           _setStatus('connected');_updateBal();_updateMetrics();
-          // Subscribe to live balance stream — this is the authoritative source
           _send({balance:1,subscribe:1},function(br){
             if(!br.error&&br.balance){
-              var b=parseFloat(String(br.balance.balance).replace(/,/g,''));
-              console.log('[API] Live balance confirmed:',b,br.balance.currency);
-              S.balance=b;S.currency=br.balance.currency||S.currency;
+              S.balance=parseFloat(String(br.balance.balance).replace(/,/g,''))||S.balance;
+              S.currency=br.balance.currency||S.currency;
               _updateBal();_updateMetrics();
             }
           });
-          // Subscribe to transaction stream for real-time trade tracking
           _send({transaction:1,subscribe:1});
-          // Load any currently open contracts
-          _send({portfolio:1},function(pr){
-            if(!pr.error){
-              (pr.portfolio.contracts||[]).forEach(function(c){
-                _send({proposal_open_contract:1,contract_id:c.contract_id,subscribe:1});
-                S.activeTrades++;
-              });
+          _send({balance:1},function(br2){
+            if(!br2.error&&br2.balance){
+              S.balance=parseFloat(String(br2.balance.balance).replace(/,/g,''))||S.balance;
+              S.currency=br2.balance.currency||S.currency;
+              _updateBal();_updateMetrics();
             }
+          });
+          _send({portfolio:1},function(pr){
+            if(!pr.error)(pr.portfolio.contracts||[]).forEach(function(c){
+              _send({proposal_open_contract:1,contract_id:c.contract_id,subscribe:1});
+              S.activeTrades++;
+            });
             _updateMetrics();
           });
           Ticker.start();Dashboard.init();
-          var acctLabel=S.accountType==='real'?'REAL ACCOUNT LIVE':'Demo Account';
-          _toast('Connected: '+acctLabel,S.loginid+' | '+S.currency+' '+S.balance.toFixed(2)+(S.accountType==='real'?' | REAL FUNDS':' | Demo funds'),'s',8000);
-          setTimeout(function(){AE.warmup();},500);
-          // Force balance refresh after 2s to ensure sync
-          setTimeout(function(){requestFreshBalance();},2000);
-          setTimeout(function(){_updateBal();_updateMetrics();},3000);
+          var acctLabel = S.accountType==='real' ? 'REAL MONEY ACCOUNT' : 'Demo Account';
+          _toast('Connected: '+acctLabel,
+            S.loginid+' | '+S.currency+' '+S.balance.toFixed(2)+
+            (S.accountType==='real'?' | All trades are REAL':''),
+            's',8000);
+          console.log('====================================');
+          console.log('NEXUS TRADE -- Connected to Deriv');
+          console.log('Login ID:    ', S.loginid);
+          console.log('Account type:', S.accountType, '(is_virtual from Deriv)');
+          console.log('Balance:     ', S.balance, S.currency);
+          console.log('Real trades: ', S.accountType==='real' ? 'YES -- affects real funds' : 'NO -- demo only');
+          console.log('====================================');
+          setTimeout(function(){AE.warmup();},800);
+          setTimeout(function(){_updateBal();_updateMetrics();},1500);
         });
       },300);
     };
-
-    ws.onmessage=function(e){
-      try{_handle(JSON.parse(e.data));}catch(err){console.error('[WS parse error]',err);}
-    };
+    ws.onmessage=function(e){try{_handle(JSON.parse(e.data));}catch(err){console.error('[WS parse]',err);}};
     ws.onerror=function(e){console.error('[WS error]',e);};
     ws.onclose=function(e){
       clearTimeout(connTimeout);_stopPing();
-      console.log('[WS] Closed | code:',e.code,'| wasClean:',e.wasClean);
+      console.log('[WS] closed | code:',e.code,'| reason:',e.reason,'| wasClean:',e.wasClean);
       if(S.connected){
-        S.connected=false;_setStatus('disconnected');
-        _toast('Connection lost','Reconnecting to Deriv...','i',3000);
+        // Was connected, lost connection -- try to reconnect
+        S.connected=false;
+        _setStatus('disconnected');
+        _toast('Connection lost','Reconnecting to Deriv...','i');
         _schedReconn();
-      }else if(token&&!S._authFailed){
+      } else if(token && !S._authFailed){
+        // Connection closed before auth -- try next endpoint
         wsIdx++;
-        if(wsIdx<WS_ENDPOINTS.length){console.log('[WS] Trying next endpoint');setTimeout(function(){_open();},1500);}
-        else{wsIdx=0;_schedReconn();}
-      }else{_setStatus('disconnected');}
+        if(wsIdx<WS_ENDPOINTS.length){
+          console.log('[WS] Trying next endpoint...');
+          setTimeout(function(){_open();},1500);
+        } else {
+          wsIdx=0;
+          _schedReconn();
+        }
+      } else {
+        // Auth failed -- don't reconnect, show error
+        _setStatus('disconnected');
+      }
     };
   }
 
   function _schedReconn(){
-    if(reconnAttempts>=8){_toast('Reconnect Failed','Refresh the page to try again.','e');_setStatus('disconnected');return;}
+    if(reconnAttempts>=8){_toast('Failed','Could not reconnect. Refresh page.','e');_setStatus('disconnected');return;}
     var d=Math.min(3000*Math.pow(1.5,reconnAttempts),30000);
     reconnAttempts++;wsIdx=0;_setStatus('connecting');
     clearTimeout(reconnTimer);
@@ -956,53 +969,50 @@ var API = (function(){
   function _handle(msg){
     if(msg.req_id&&pending[msg.req_id]){var cb=pending[msg.req_id];delete pending[msg.req_id];cb(msg);}
     var t=msg.msg_type;
-
     if(t==='tick'){
-      var tick=msg.tick;var p=parseFloat(tick.quote);
+      var tick=msg.tick;
+      var p=parseFloat(tick.quote);
       tickPrices[tick.symbol]=p;
       (tickSubs[tick.symbol]||[]).forEach(function(fn){fn({symbol:tick.symbol,price:p,epoch:tick.epoch});});
       Ticker.onTick(tick.symbol,p);
     }
-
-    if(t==='proposal_open_contract'&&msg.proposal_open_contract){
-      Trader.onContractUpdate(msg.proposal_open_contract);
-    }
-
-    // ── BALANCE: always trust Deriv's stream — single source of truth ──
+    if(t==='proposal_open_contract'&&msg.proposal_open_contract)Trader.onContractUpdate(msg.proposal_open_contract);
     if(t==='balance'&&msg.balance){
-      var newBal=parseFloat(String(msg.balance.balance).replace(/,/g,''));
-      var newCur=msg.balance.currency||S.currency;
-      console.log('[API] Balance update from Deriv:',newBal,newCur,'(was:'+S.balance+')');
-      S.balance=newBal;S.currency=newCur;
-      _updateBal();_updateMetrics();
+      // This is the authoritative balance from Deriv's server
+      // Always trust this over any local calculation
+      var derivBal=parseFloat(String(msg.balance.balance).replace(/,/g,''));
+      console.log('[API] Balance stream from Deriv:',derivBal,msg.balance.currency);
+      S.balance=derivBal;
+      S.currency=msg.balance.currency||S.currency;
+      _updateBal();
+      _updateMetrics();
     }
-
-    // ── TRANSACTION: every buy/sell sends updated balance ──
     if(t==='transaction'&&msg.transaction){
       var tx=msg.transaction;
-      console.log('[API] Transaction | action:',tx.action,'| amount:',tx.amount,'| balance:',tx.balance,'| contract:',tx.contract_id);
+      console.log('[API] Transaction:',tx.action,'amount:',tx.amount,'balance:',tx.balance,'loginid:',tx.loginid);
       if(tx.action==='buy'){
         S.activeTrades++;
+        // Deriv sends the new balance after every transaction
         if(tx.balance!=null){
           var buyBal=parseFloat(String(tx.balance).replace(/,/g,''));
-          console.log('[API] Balance after buy from Deriv:',buyBal);
+          console.log('[API] Balance after buy:',buyBal);
           S.balance=buyBal;
         }
         _updateMetrics();_updateBal();
       }
       if(tx.action==='sell'){
         S.activeTrades=Math.max(0,S.activeTrades-1);
-        var profit=parseFloat(tx.amount||0);
+        var pp=parseFloat(tx.amount||0);
         if(tx.balance!=null){
           var sellBal=parseFloat(String(tx.balance).replace(/,/g,''));
-          console.log('[API] Balance after sell from Deriv:',sellBal,'profit:',profit);
+          console.log('[API] Balance after sell:',sellBal,'profit:',pp);
           S.balance=sellBal;
         }
-        if(profit>0){S.wins++;S.todayPnl=parseFloat((S.todayPnl+profit).toFixed(2));}
-        else{S.losses++;S.todayPnl=parseFloat((S.todayPnl+profit).toFixed(2));}
+        if(pp>0){S.wins++;S.todayPnl=parseFloat((S.todayPnl+pp).toFixed(2));}
+        else{S.losses++;S.todayPnl=parseFloat((S.todayPnl+pp).toFixed(2));}
         _updateMetrics();_updateBal();
-        // Confirm balance 2s after sell on real account
-        if(S.accountType==='real'){setTimeout(function(){requestFreshBalance();},2000);}
+        // Request fresh balance 2 seconds after sell to confirm
+        setTimeout(function(){if(S.connected&&S.accountType==='real')API.requestFreshBalance();},2000);
       }
     }
   }
@@ -1022,6 +1032,7 @@ var API = (function(){
     if(tickSubs[sym].indexOf(cb)<0)tickSubs[sym].push(cb);
     if(tickPrices[sym]===undefined)_send({ticks:sym,subscribe:1});
   }
+
   function getTickHist(sym,count){
     count=count||300;
     return new Promise(function(res,rej){
@@ -1031,6 +1042,7 @@ var API = (function(){
       });
     });
   }
+
   function getCandleHist(sym,gran,count){
     gran=gran||60;count=count||100;
     return new Promise(function(res,rej){
@@ -1040,61 +1052,54 @@ var API = (function(){
       });
     });
   }
+
   function getProposal(p){
     return new Promise(function(res,rej){
       var pl={proposal:1,amount:p.stake,basis:'stake',contract_type:p.contractType,currency:S.currency||'USD',symbol:p.symbol};
       if(p.duration&&p.durationUnit){pl.duration=p.duration;pl.duration_unit=p.durationUnit;}
       if(p.barrier!=null)pl.barrier=String(p.barrier);
       if(p.growthRate)pl.growth_rate=p.growthRate;
-      console.log('[API] Proposal request:',JSON.stringify(pl));
-      _send(pl,function(r){
-        if(r.error){
-          console.error('[API] Proposal error:',r.error.code,r.error.message);
-          rej(r.error);return;
-        }
-        console.log('[API] Proposal OK | id:'+r.proposal.id+' | ask:'+r.proposal.ask_price+' | payout:'+r.proposal.payout);
-        res(r.proposal);
-      });
+      _send(pl,function(r){if(r.error){rej(r.error);return;}res(r.proposal);});
     });
   }
+
   function buyContract(id,price){
     return new Promise(function(res,rej){
-      console.log('[API] Buy contract | proposal_id:'+id+' | price:'+price);
       _send({buy:id,price:price},function(r){
-        if(r.error){
-          console.error('[API] Buy error:',r.error.code,r.error.message);
-          rej(r.error);return;
-        }
-        console.log('[API] Buy OK | contract_id:'+r.buy.contract_id+' | buy_price:'+r.buy.buy_price+' | payout:'+r.buy.payout);
+        if(r.error){rej(r.error);return;}
         _send({proposal_open_contract:1,contract_id:r.buy.contract_id,subscribe:1});
         res(r.buy);
       });
     });
   }
+
   function getProfitTable(limit){
     limit=limit||50;
     return new Promise(function(res){
       _send({profit_table:1,limit:limit,sort:'DESC'},function(r){res(r.error?[]:(r.profit_table.transactions||[]));});
     });
   }
+
   function getPrice(sym){return tickPrices[sym]||null;}
+
+  // Request fresh balance from Deriv -- call after trade settlement on real accounts
   function requestFreshBalance(){
     if(!ws||ws.readyState!==1)return;
     _send({balance:1},function(br){
       if(!br.error&&br.balance){
-        var b=parseFloat(String(br.balance.balance).replace(/,/g,''));
-        console.log('[API] Fresh balance from Deriv:',b,br.balance.currency);
-        S.balance=b;S.currency=br.balance.currency||S.currency;
-        _updateBal();_updateMetrics();
+        var newBal=parseFloat(String(br.balance.balance).replace(/,/g,''));
+        console.log('[API] Fresh balance from Deriv:',newBal,br.balance.currency);
+        S.balance=newBal;
+        S.currency=br.balance.currency||S.currency;
+        _updateBal();
+        _updateMetrics();
       }
     });
   }
 
-  return{connect:connect,disconnect:disconnect,subTick:subTick,
-    getTickHist:getTickHist,getCandleHist:getCandleHist,
-    getProposal:getProposal,buyContract:buyContract,
-    getProfitTable:getProfitTable,getPrice:getPrice,
-    requestFreshBalance:requestFreshBalance};
+  return{connect:connect,disconnect:disconnect,subTick:subTick,getTickHist:getTickHist,
+    getCandleHist:getCandleHist,getProposal:getProposal,buyContract:buyContract,
+    getProfitTable:getProfitTable,getPrice:getPrice,requestFreshBalance:requestFreshBalance};
 })();
 
 // ── Ticker ────────────────────────────────────────────────
@@ -1425,51 +1430,19 @@ var AE = (function(){
       patterns:[],bullScore:50,bearScore:50,timestamp:Date.now()};
   }
 
-function quick(sym){return analyse(sym).catch(function(e){return _mock(sym,e.message);});}
-
-  // Pre-fetch latest analysis for a symbol and cache it
-  // Returns cached result if fresh enough (< 8 seconds old)
-  var _quickCache = {};
-  function quickCached(sym){
-    var now = Date.now();
-    var cached = _quickCache[sym];
-    if(cached && (now - cached.timestamp) < 8000){
-      return Promise.resolve(cached);
-    }
-    return analyse(sym).then(function(r){
-      _quickCache[sym] = r;
-      return r;
-    }).catch(function(e){ return _mock(sym,e.message); });
-  }
+  function quick(sym){return analyse(sym).catch(function(e){return _mock(sym,e.message);});}
 
   function warmup(){
-    console.log('[AE] Warming up all',ALL_SCAN_SYMS.length,'symbols...');
-    // Subscribe live ticks for ALL symbols immediately
-    ALL_SCAN_SYMS.forEach(function(s,i){
-      setTimeout(function(){ _sub(s); }, i * 80);
-    });
-    // Pre-load tick history for priority symbols immediately
-    var priority = [
-      '1HZ50V','1HZ75V','1HZ25V','1HZ100V',
-      'BOOM500','CRASH500','frxEURUSD','frxGBPUSD',
-      'frxXAUUSD','JD100','R_50','BOOM1000'
-    ];
+    console.log('[AE] warming up',ALL_SCAN_SYMS.length,'symbols');
+    ALL_SCAN_SYMS.forEach(function(s,i){setTimeout(function(){_sub(s);},i*100);});
     setTimeout(function(){
-      priority.forEach(function(s,i){
-        setTimeout(function(){ _load(s).catch(function(){}); }, i * 300);
+      ['1HZ50V','1HZ75V','1HZ25V','BOOM500','CRASH500','frxEURUSD','frxXAUUSD'].forEach(function(s,i){
+        setTimeout(function(){_load(s).catch(function(){});},i*500);
       });
-    }, 2000);
-    // Load remaining symbols after 15 seconds
-    setTimeout(function(){
-      ALL_SCAN_SYMS.forEach(function(s,i){
-        if(priority.indexOf(s) < 0){
-          setTimeout(function(){ _load(s).catch(function(){}); }, i * 200);
-        }
-      });
-    }, 15000);
+    },5000);
   }
 
-  return{analyse:analyse,quick:quick,quickCached:quickCached,warmup:warmup,ALL_SCAN_SYMS:ALL_SCAN_SYMS,_cache:_cache,_load:_load};
+  return{analyse:analyse,quick:quick,warmup:warmup,ALL_SCAN_SYMS:ALL_SCAN_SYMS,_cache:_cache,_load:_load};
 })();
 
 // ── Trade Feed ────────────────────────────────────────────
@@ -1494,43 +1467,64 @@ function _feedUpdate(entry){
 
 // ── Trader ────────────────────────────────────────────────
 var Trader = (function(){
-function onContractUpdate(c){
+  function onContractUpdate(c){
     var entry=S.openContracts[c.contract_id];if(!entry)return;
-    // Update current profit while trade is still open
-    if(!c.is_sold&&c.status!=='sold'){
-      if(c.profit!==undefined)entry.currentProfit=parseFloat(c.profit||0);
+
+    // Always update current profit display while trade is open
+    if(!c.is_sold && c.status!=='sold' && c.profit!==undefined){
+      entry.currentProfit = parseFloat(c.profit||0);
       return;
     }
-    // ── Trade settled ─────────────────────────────────────
-    var profit=parseFloat(c.profit);
-    var won=profit>0;
-    entry.status='closed';entry.won=won;entry.pnl=profit;entry.closeTime=Date.now();
-    S.activeTrades=Math.max(0,S.activeTrades-1);
-    // Track P&L
-    S.todayPnl=parseFloat((S.todayPnl+profit).toFixed(2));
-    if(won){S.wins++;S.streak=S.streakType==='win'?S.streak+1:1;S.streakType='win';}
-    else{S.losses++;S.streak=S.streakType==='loss'?S.streak+1:1;S.streakType='loss';}
-    // For real trades: balance comes from the 'balance' stream and 'transaction' stream
-    // Deriv pushes these automatically — we trust them over local calculation
-    // For simulated trades only: update balance locally
-    if(entry.simulated){
-      S.balance=parseFloat((S.balance+profit).toFixed(2));
+
+    if(c.is_sold||c.status==='sold'){
+      var p=parseFloat(c.profit);var won=p>0;
+      entry.status='closed';entry.won=won;entry.pnl=p;entry.closeTime=Date.now();
+      S.activeTrades=Math.max(0,S.activeTrades-1);
+
+      // Update P&L tracking
+      S.todayPnl = parseFloat((S.todayPnl + p).toFixed(2));
+      if(won){
+        S.wins++;
+        S.streak = S.streakType==='win' ? S.streak+1 : 1;
+        S.streakType='win';
+      } else {
+        S.losses++;
+        S.streak = S.streakType==='loss' ? S.streak+1 : 1;
+        S.streakType='loss';
+      }
+
+      // For real accounts: balance is updated by the 'balance' subscription stream
+      // which Deriv pushes automatically after every settled contract.
+      // For demo/sim: update locally.
+      if(entry.simulated){
+        S.balance = parseFloat((S.balance + p).toFixed(2));
+      }
+      // For real accounts, trust the balance subscription (handled in _handle)
+      // but also request a fresh balance to be sure
+      if(!entry.simulated && S.connected){
+        // Request fresh balance from Deriv to ensure sync
+        setTimeout(function(){
+          API.requestFreshBalance();
+        }, 1500);
+      }
+
+      delete S.openContracts[c.contract_id];
+      _updateMetrics();
+      _feedUpdate(entry);
+
+      // Show result toast
+      if(won){
+        _toast('WIN! +$'+p.toFixed(2),
+          (entry.real?'REAL':'Demo')+' '+entry.contractType+' on '+(SYMS[entry.symbol]||entry.symbol),
+          's',6000);
+      } else {
+        _toast('Loss -$'+Math.abs(p).toFixed(2),
+          (entry.real?'REAL':'Demo')+' '+entry.contractType+' on '+(SYMS[entry.symbol]||entry.symbol),
+          'e',5000);
+      }
+
+      if(entry._resolve)entry._resolve({won:won,pnl:p,stake:entry.stake});
     }
-    // Always request fresh balance after real trade settles to confirm sync
-    if(!entry.simulated&&S.connected){
-      setTimeout(function(){API.requestFreshBalance();},1500);
-      setTimeout(function(){API.requestFreshBalance();},4000);
-    }
-    console.log('[Trade] Settled | contract:',c.contract_id,'| profit:',profit,'| real:',!entry.simulated,'| balance after:',S.balance);
-    delete S.openContracts[c.contract_id];
-    _updateMetrics();_feedUpdate(entry);
-    if(won){
-      _toast('WIN! +$'+profit.toFixed(2),(entry.real?'REAL':'Demo')+' '+entry.contractType+' on '+(SYMS[entry.symbol]||entry.symbol)+' | Balance: '+S.currency+' '+S.balance.toFixed(2),'s',6000);
-    }else{
-      _toast('Loss -$'+Math.abs(profit).toFixed(2),(entry.real?'REAL':'Demo')+' '+entry.contractType+' on '+(SYMS[entry.symbol]||entry.symbol)+' | Balance: '+S.currency+' '+S.balance.toFixed(2),'e',5000);
-    }
-    if(entry._resolve)entry._resolve({won:won,pnl:profit,stake:entry.stake});
-  }
   }
 
   function _sim(params,source){
@@ -1556,23 +1550,31 @@ function onContractUpdate(c){
     });
   }
 
- function executeTrade(params,source){
+  function executeTrade(params,source){
     source=source||'manual';
     if(!S.connected)return Promise.reject(new Error('Not connected'));
     if(S.activeTrades>=MAX_TRADES)return Promise.reject(new Error('Max active trades reached'));
-    var isReal=S.accountType==='real';
 
-    // ── For real accounts: execute only via Deriv API — never simulate ──
-    // ── For demo accounts: try API first, fall back to simulation ────────
+    // Determine if this is a real account -- never silently simulate real trades
+    var isReal = S.accountType === 'real';
+
     return API.getProposal(params).then(function(proposal){
       if(!proposal||!proposal.id){
         if(isReal){
-          return Promise.reject(new Error('Proposal failed — real trade NOT placed'));
+          var errMsg='Proposal failed -- trade NOT placed on real account';
+          _toast('Trade Failed',errMsg,'e',6000);
+          return Promise.reject(new Error(errMsg));
         }
+        console.log('[Trade] Demo sim (no proposal)');
         return _sim(params,source);
       }
-      _toast('Placing trade...','Sending to Deriv: '+params.contractType+' on '+(SYMS[params.symbol]||params.symbol)+' $'+params.stake,'i',2000);
+
+      // Log the proposal for transparency
+      console.log('[Trade] Proposal OK -- id:'+proposal.id+' ask:'+proposal.ask_price+' payout:'+proposal.payout);
+      _toast('Placing trade...','Sending to Deriv: '+params.contractType+' $'+params.stake,'i',2000);
+
       return API.buyContract(proposal.id,proposal.ask_price).then(function(buy){
+        console.log('[Trade] BUY OK -- contract_id:'+buy.contract_id+' buy_price:'+buy.buy_price);
         S.activeTrades++;
         var entry={
           id:buy.contract_id,
@@ -1580,26 +1582,33 @@ function onContractUpdate(c){
           symbol:params.symbol,
           stake:parseFloat(buy.buy_price),
           payout:parseFloat(buy.payout),
-          status:'open',
-          source:source,
-          openTime:Date.now(),
-          pnl:null,won:null,
-          real:isReal,
-          simulated:false,
+          status:'open',source:source,
+          openTime:Date.now(),pnl:null,won:null,
+          real: isReal,
         };
         S.openContracts[buy.contract_id]=entry;
         S.tradeHistory.unshift(entry);
         _updateMetrics();_feedAdd(entry);
-        console.log('[Trade] Placed on Deriv | contract:',buy.contract_id,'| buy_price:',buy.buy_price,'| payout:',buy.payout,'| real:',isReal);
+        _toast('Trade Placed!',
+          (isReal?'REAL':'Demo')+' '+params.contractType+' on '+(SYMS[params.symbol]||params.symbol)+' $'+params.stake,
+          'i',3000);
         return new Promise(function(res){entry._resolve=res;});
       }).catch(function(e){
-        console.error('[Trade] Buy failed:',e.message);
-        if(isReal){return Promise.reject(new Error('Buy failed on real account: '+e.message));}
+        console.error('[Trade] BUY FAILED:',e.message);
+        if(isReal){
+          _toast('Buy Failed',e.message+' -- no real trade placed','e',8000);
+          return Promise.reject(e);
+        }
+        console.log('[Trade] Demo sim fallback after buy error');
         return _sim(params,source);
       });
     }).catch(function(e){
-      console.error('[Trade] Proposal failed:',e.message);
-      if(isReal){return Promise.reject(new Error('Proposal failed on real account: '+e.message));}
+      console.error('[Trade] PROPOSAL FAILED:',e.message);
+      if(isReal){
+        _toast('Proposal Failed',e.message+' -- no real trade placed','e',8000);
+        return Promise.reject(e);
+      }
+      console.log('[Trade] Demo sim fallback after proposal error');
       return _sim(params,source);
     });
   }
@@ -1625,276 +1634,78 @@ function onContractUpdate(c){
     }
   }
 
- // ── Market scoring weights for profit-first selection ──
-  var MARKET_SCORES = {}; // tracks per-symbol win history
-  var SCAN_INTERVAL = 1500; // ms between scans — fast continuous loop
-
   function _startLoop(){
-    clearTimeout(S.autoTimer);
-    clearInterval(S.autoInterval);
-    S._loopRunning = false;
-    S._scanCycle = 0;
-    _toast('Auto-Trading ON','Scanning all '+AE.ALL_SCAN_SYMS.length+' markets continuously...','s',4000);
-    console.log('[Loop] Starting continuous scan loop on',AE.ALL_SCAN_SYMS.length,'markets');
-
+    clearTimeout(S.autoTimer);S._loopRunning=false;
+    _toast('Scanning Markets...','Analysing all markets - will execute when favourable','i');
     function tick(){
-      if(!S.autoTrade){ S._loopRunning=false; console.log('[Loop] Stopped'); return; }
-      if(!S.connected){ S.autoTimer=setTimeout(tick,2000); return; }
-      S._loopRunning = true;
-      S._scanCycle = (S._scanCycle||0) + 1;
-
-      // ── Daily limit guards ──────────────────────────────
-      var tp = parseFloat(($('cfgTP')&&$('cfgTP').value)||'0')||0;
-      var sl = parseFloat(($('cfgSL')&&$('cfgSL').value)||'0')||0;
-      if(tp>0 && S.todayPnl>=tp){
-        toggleAuto();
-        _toast('Daily Target Hit!','Take profit $'+tp+' reached — auto-trading stopped','s',8000);
-        return;
-      }
-      if(sl>0 && S.todayPnl<=-sl){
-        toggleAuto(); Bots.stopAll();
-        _toast('Daily Loss Limit!','Stop loss -$'+sl+' reached — all trading stopped','e',8000);
-        return;
-      }
-
-      // ── Max concurrent trades guard ─────────────────────
-      if(S.activeTrades >= MAX_TRADES){
-        S.autoTimer = setTimeout(tick, 1500);
-        return;
-      }
-
-      // ── Check manual rules first ────────────────────────
-      var rule = _getRule();
-      if(rule){
-        _execRule(rule).catch(function(e){ console.warn('[Rule]',e.message); }).then(function(){
-          if(S.autoTrade) S.autoTimer = setTimeout(tick, SCAN_INTERVAL);
-        });
-        return;
-      }
-
-      // ── Run continuous market scan ──────────────────────
-      _autoTrade().catch(function(e){
-        console.warn('[AutoTrade]',e.message);
-      }).then(function(){
-        if(S.autoTrade){
-          // Reschedule immediately — no long wait
-          var delay = S.activeTrades > 0 ? 2000 : SCAN_INTERVAL;
-          S.autoTimer = setTimeout(tick, delay);
-        }
+      if(!S.autoTrade){S._loopRunning=false;return;}
+      if(!S.connected){S.autoTimer=setTimeout(tick,3000);return;}
+      S._loopRunning=true;
+      var tp=parseFloat($('cfgTP')?$('cfgTP').value:'0')||0;
+      var sl=parseFloat($('cfgSL')?$('cfgSL').value:'0')||0;
+      if(tp>0&&S.todayPnl>=tp){toggleAuto();_toast('Take Profit!','+$'+S.todayPnl.toFixed(2)+' reached','s');return;}
+      if(sl>0&&S.todayPnl<=-sl){toggleAuto();Bots.stopAll();_toast('Stop Loss!','-$'+Math.abs(S.todayPnl).toFixed(2)+' reached','e');return;}
+      if(S.activeTrades>=MAX_TRADES){S.autoTimer=setTimeout(tick,3000);return;}
+      var rule=_getRule();
+      var p=rule?_execRule(rule).catch(function(e){console.warn('[Rule]',e.message);}):_autoTrade().catch(function(e){console.warn('[AutoTrade]',e.message);});
+      p.then(function(){
+        if(S.autoTrade){var d=S.activeTrades>0?4000:2000;S.autoTimer=setTimeout(tick,d);}
       });
     }
-
-    // Start IMMEDIATELY — first scan right away
     tick();
   }
 
-function _autoTrade(){
-    var thresh = parseInt(($('cfgConf')&&$('cfgConf').value)||'62')||62;
-    var stake  = parseFloat(($('cfgStake')&&$('cfgStake').value)||'1')||1;
-    var scanList = AE.ALL_SCAN_SYMS;
-
-    // ── Scan all markets in small fast batches ──────────
-    var BATCH = 6;
-    var allResults = [];
-    var batchIdx = 0;
-
-    function runBatch(){
-      if(batchIdx >= scanList.length) return Promise.resolve(allResults);
-      var batch = scanList.slice(batchIdx, batchIdx + BATCH);
-      batchIdx += BATCH;
-     return Promise.all(batch.map(function(sym){
-        return AE.quickCached(sym).catch(function(){ return null; });
-      })).then(function(res){
-        res.forEach(function(r){ if(r && r.currentPrice > 0) allResults.push(r); });
-        // Small gap between batches to avoid WS flood
-        return new Promise(function(resolve){ setTimeout(function(){ resolve(runBatch()); }, 80); });
-      });
+  function _autoTrade(){
+    var thresh=parseInt($('cfgConf')?$('cfgConf').value:'62')||62;
+    var stake=parseFloat($('cfgStake')?$('cfgStake').value:'1')||1;
+    var scanList=AE.ALL_SCAN_SYMS;
+    console.log('[AutoTrade] scanning',scanList.length,'markets threshold:',thresh+'%');
+    var BATCH=8,allR=[],idx=0;
+    function nextBatch(){
+      if(idx>=scanList.length){
+        return Promise.resolve(allR);
+      }
+      var batch=scanList.slice(idx,idx+BATCH);idx+=BATCH;
+      return Promise.all(batch.map(function(s){return AE.quick(s).catch(function(){return null;});}))
+        .then(function(res){
+          res.forEach(function(r){if(r)allR.push(r);});
+          return new Promise(function(resolve){setTimeout(function(){resolve(nextBatch());},250);});
+        });
     }
-
-    return runBatch().then(function(){
-      console.log('[AutoTrade] Cycle #'+S._scanCycle+' | Scanned:',allResults.length,'| Threshold:',thresh+'%');
-
-      // ── Filter: must be clear direction + meet confidence ──
-      var candidates = allResults.filter(function(r){
-        return r.direction !== 'NEUTRAL'
-          && r.confidence >= thresh
-          && r.currentPrice > 0;
+    return nextBatch().then(function(results){
+      console.log('[AutoTrade] scanned',results.length,'finding best signal...');
+      var valid=results.filter(function(a){return a&&a.direction!=='NEUTRAL'&&a.confidence>=thresh&&a.currentPrice>0;});
+      valid.sort(function(a,b){
+        var pw=function(p){return p==='HIGH'?1.3:p==='MEDIUM'?1.1:1;};
+        return(b.confidence*pw(b.projectedProfit))-(a.confidence*pw(a.projectedProfit));
       });
-
-      if(!candidates.length){
-        console.log('[AutoTrade] No qualifying signals at',thresh+'% — continuing scan...');
+      if(!valid.length){
+        console.log('[AutoTrade] no signals >= threshold',thresh);
+        _toast('Scanning...','No qualifying signal across '+results.length+' markets - rescanning','i',2500);
         return;
       }
-
-      // ── Advanced profit-first scoring ────────────────────
-      // Score combines: confidence, trend alignment, MACD alignment,
-      // projected profit, digit bias strength, and historical win rate
-      candidates.forEach(function(r){
-        var score = r.confidence;
-
-        // Bonus: projected profit rating
-        if(r.projectedProfit === 'HIGH')   score += 15;
-        if(r.projectedProfit === 'MEDIUM') score += 7;
-
-        // Bonus: trend and direction aligned
-        var trend = r.indicators && r.indicators.trend;
-        if(trend){
-          if(r.direction==='BUY'  && trend.direction==='uptrend')   score += 10;
-          if(r.direction==='SELL' && trend.direction==='downtrend')  score += 10;
-          score += Math.min(trend.strength||0, 20) * 0.3;
-        }
-
-        // Bonus: MACD confirms direction
-        var macd = r.indicators && r.indicators.macd;
-        if(macd){
-          if(r.direction==='BUY'  && macd.bullish)  score += 8;
-          if(r.direction==='SELL' && !macd.bullish) score += 8;
-          if(macd.crossUp   && r.direction==='BUY')  score += 12;
-          if(macd.crossDown && r.direction==='SELL') score += 12;
-        }
-
-        // Bonus: RSI in favourable zone
-        var rsi = r.indicators && r.indicators.rsi;
-        if(rsi !== null && rsi !== undefined){
-          if(r.direction==='BUY'  && rsi < 35)  score += 10;
-          if(r.direction==='BUY'  && rsi < 45)  score += 5;
-          if(r.direction==='SELL' && rsi > 65)  score += 10;
-          if(r.direction==='SELL' && rsi > 55)  score += 5;
-        }
-
-        // Bonus: Bollinger band confirmation
-        var bb = r.indicators && r.indicators.bb;
-        if(bb){
-          if(r.direction==='BUY'  && bb.belowLower)  score += 12;
-          if(r.direction==='BUY'  && bb.nearLower)   score += 6;
-          if(r.direction==='SELL' && bb.aboveUpper)  score += 12;
-          if(r.direction==='SELL' && bb.nearUpper)   score += 6;
-        }
-
-        // Bonus: Stochastic crossover in extreme zone
-        var stoch = r.indicators && r.indicators.stoch;
-        if(stoch){
-          if(r.direction==='BUY'  && stoch.oversold  && stoch.crossUp)   score += 10;
-          if(r.direction==='SELL' && stoch.overbought && stoch.crossDown) score += 10;
-        }
-
-        // Bonus: Digit frequency strong bias for synthetics
-        var df = r.indicators && r.indicators.df;
-        if(df){
-          if(df.strongEvenBias || df.strongOddBias) score += 8;
-          if(df.recentEvenBias || df.recentOddBias) score += 5;
-        }
-
-        // Penalty: MTF not aligned
-        if(!r.mtfAligned) score -= 8;
-
-        // Penalty: weak projected profit
-        if(r.projectedProfit === 'LOW') score -= 10;
-
-        // Historical win rate bonus for this symbol
-        var symHistory = MARKET_SCORES[r.sym];
-        if(symHistory && symHistory.total >= 3){
-          var wr = symHistory.wins / symHistory.total;
-          if(wr >= 0.7) score += 12;
-          else if(wr >= 0.6) score += 6;
-          else if(wr < 0.4) score -= 15; // avoid consistently losing markets
-        }
-
-        r._score = Math.round(score);
-      });
-
-      // ── Sort by composite score (highest first) ──────────
-      candidates.sort(function(a,b){ return b._score - a._score; });
-
-      // Log top 3 candidates
-      console.log('[AutoTrade] Top signals:');
-      candidates.slice(0,3).forEach(function(r){
-        console.log('  ',r.sym, r.direction, r.confidence+'%',
-          'score:'+r._score, 'proj:'+r.projectedProfit,
-          'rsi:'+(r.indicators&&r.indicators.rsi||'n/a'));
-      });
-
-      // ── Pick the best signal ─────────────────────────────
-      var best = candidates[0];
-
-      // Only trade if the composite score clears a high bar
-      var minScore = thresh + 10;
-      if(best._score < minScore){
-        console.log('[AutoTrade] Best score',best._score,'< min',minScore,'— waiting for stronger signal');
-        return;
+      var best=valid[0],sym=best.sym;
+      var ct=best.direction==='BUY'?'CALL':'PUT';
+      var is1s=sym.startsWith('1HZ')||sym.startsWith('R_')||sym==='stpRNG';
+      if(is1s&&best.indicators&&best.indicators.df){
+        var df=best.indicators.df;
+        if(df.strongEvenBias||(df.evenBias&&df.recentEvenBias))ct='DIGITEVEN';
+        else if(df.strongOddBias||(df.oddBias&&df.recentOddBias))ct='DIGITODD';
+        else if(df.overBias)ct='DIGITOVER';
+        else if(df.underBias)ct='DIGITUNDER';
       }
-
-      var sym = best.sym;
-
-      // ── Determine exact contract type ────────────────────
-      var ct = best.direction === 'BUY' ? 'CALL' : 'PUT';
-
-      // Synthetics (1s): use digit contracts when digit bias is strong
-      var is1s = sym.startsWith('1HZ') || sym.startsWith('R_') || sym==='stpRNG';
-      if(is1s && best.indicators && best.indicators.df){
-        var df = best.indicators.df;
-        // Only use digits when there is a STRONG statistical bias
-        if(df.strongEvenBias && df.recentEvenBias)        ct = 'DIGITEVEN';
-        else if(df.strongOddBias && df.recentOddBias)     ct = 'DIGITODD';
-        else if(df.overBias  && df.overPct  > 60)         { ct = 'DIGITOVER';  }
-        else if(df.underBias && df.underPct > 60)         { ct = 'DIGITUNDER'; }
-        // Fall back to CALL/PUT if digit bias is weak
-      }
-
-      // Duration — ticks for synthetics, minutes for forex/indices
-      var isFx = sym.startsWith('frx')||sym.startsWith('cry')||sym.startsWith('OTC');
-      var durU = isFx ? 'm' : 't';
-      var dur  = 5;
-      var barrier = ct==='DIGITOVER'?4:ct==='DIGITUNDER'?5:null;
-
-      console.log('[AutoTrade] EXECUTING:',sym,ct,
-        '| conf:'+best.confidence+'% score:'+best._score,
-        '| proj:'+best.projectedProfit,
-        '| stake:$'+stake);
-
-      _toast(
-        (SYMS[sym]||sym)+' \u2192 '+ct,
-        'Conf: '+best.confidence+'% | Score: '+best._score+' | $'+stake,
-        'i', 2500
-      );
-
-      if(!S.connected || S.activeTrades >= MAX_TRADES) return;
-
-      var params = {
-        symbol:sym, contractType:ct, stake:stake,
-        duration:dur, durationUnit:durU,
-        barrier:barrier, growthRate:null,
-        _conf:best.confidence, _autoMode:true,
-      };
-
+      var isFx=sym.startsWith('frx')||sym.startsWith('cry')||sym.startsWith('OTC');
+      var durU=isFx?'m':'t',dur=5;
+      var barrier=ct==='DIGITOVER'?4:ct==='DIGITUNDER'?5:null;
+      console.log('[AutoTrade] EXECUTING',sym,ct,'conf:',best.confidence+'%','proj:',best.projectedProfit);
+      _toast(N(sym)+' > '+ct,'Conf: '+best.confidence+'% | '+best.projectedProfit+' | $'+stake,'i',3000);
+      if(!S.connected||S.activeTrades>=MAX_TRADES)return;
+      var params={symbol:sym,contractType:ct,stake:stake,duration:dur,durationUnit:durU,barrier:barrier,growthRate:null,_conf:best.confidence,_autoMode:true};
       return executeTrade(params,'AUTO').then(function(r){
-        // ── Update per-symbol win history ─────────────────
-        if(!MARKET_SCORES[sym]) MARKET_SCORES[sym]={wins:0,losses:0,total:0};
-        MARKET_SCORES[sym].total++;
-        if(r.won){
-          MARKET_SCORES[sym].wins++;
-          _toast(
-            'WIN +$'+r.pnl.toFixed(2),
-            (SYMS[sym]||sym)+' \u2014 '+ct+
-            ' | P&L today: '+(S.todayPnl>=0?'+':'')+S.todayPnl.toFixed(2),
-            's', 5000
-          );
-        } else {
-          MARKET_SCORES[sym].losses++;
-          _toast(
-            'Loss -$'+stake,
-            (SYMS[sym]||sym)+' \u2014 '+ct+
-            ' | P&L today: '+(S.todayPnl>=0?'+':'')+S.todayPnl.toFixed(2),
-            'e', 4000
-          );
-        }
-        _updateMetrics(); _updateBal();
-      }).catch(function(e){
-        console.error('[AutoTrade] Execution error:',e.message);
-        if(e.message && e.message.indexOf('real account')>=0){
-          _toast('Trade Error',e.message,'e',8000);
-        }
-      });
+        if(r.won){_toast('AUTO WIN +$'+r.pnl.toFixed(2),N(sym)+' - '+ct+' | Bal: '+S.currency+' '+S.balance.toFixed(2),'s',5000);}
+        else{_toast('AUTO LOSS -$'+stake,N(sym)+' - '+ct+' | Bal: '+S.currency+' '+S.balance.toFixed(2),'e',5000);}
+        _updateMetrics();_updateBal();
+      }).catch(function(e){console.error('[AutoTrade error]',e.message);});
     });
   }
 
@@ -2524,18 +2335,49 @@ function _wire(){
 
 // ── Boot ──────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded',function(){
-  console.log('[NEXUS TRADE] booting...');
-  try{Bots.init();}catch(e){console.error('[Bots]',e);}
-  try{Ticker.startSim();}catch(e){console.error('[Ticker]',e);}
-  try{Markets.render();}catch(e){console.error('[Markets]',e);}
-  try{_wire();}catch(e){console.error('[Wire]',e);}
-  setTimeout(function(){try{Auth.show();}catch(e){console.error('[Auth.show]',e);}},600);
+  console.log('[NEXUS TRADE] v3.0 booting...');
+  // Step 1: Init bots
+  try{Bots.init();}catch(e){console.error('[Boot] Bots.init failed:',e.message);}
+  // Step 2: Start simulated ticker prices
+  try{Ticker.startSim();}catch(e){console.error('[Boot] Ticker failed:',e.message);}
+  // Step 3: Render markets page
+  try{Markets.render();}catch(e){console.error('[Boot] Markets failed:',e.message);}
+  // Step 4: Wire ALL buttons - critical step
+  try{
+    _wire();
+    console.log('[Boot] Buttons wired OK');
+  }catch(e){
+    console.error('[Boot] _wire() failed:',e.message,e.stack);
+    // Emergency fallback: try to wire connect button manually
+    setTimeout(function(){
+      try{
+        var cb=document.getElementById('connBtn');
+        if(cb)cb.onclick=function(){Auth.show();};
+        var acb=document.getElementById('authConnectBtn');
+        if(acb)acb.onclick=function(){Auth.connect();};
+        var dt=document.getElementById('demoTab');
+        if(dt)dt.onclick=function(){Auth.switchType('demo');};
+        var rt=document.getElementById('realTab');
+        if(rt)rt.onclick=function(){Auth.switchType('real');};
+        var ac=document.getElementById('authClose');
+        if(ac)ac.onclick=function(){Auth.close();};
+        console.log('[Boot] Emergency button wiring done');
+      }catch(e2){console.error('[Boot] Emergency wire failed:',e2.message);}
+    },100);
+  }
+  // Step 5: Show auth modal
+  setTimeout(function(){
+    try{Auth.show();}catch(e){console.error('[Boot] Auth.show failed:',e.message);}
+  },500);
+  // Step 6: Keep toggles in sync
   setInterval(function(){
-    var on=S.autoTrade;
-    document.querySelectorAll('.btog').forEach(function(el){el.classList.toggle('on',on);});
-    var l=$('atLbl');if(l)l.textContent=on?'ON':'OFF';
+    try{
+      var on=S.autoTrade;
+      document.querySelectorAll('.btog').forEach(function(el){el.classList.toggle('on',on);});
+      var l=document.getElementById('atLbl');if(l)l.textContent=on?'ON':'OFF';
+    }catch(e){}
   },800);
-  console.log('[NEXUS TRADE] Ready');
+  console.log('[NEXUS TRADE] v3.0 Ready');
 });
 </script>
 </body>
