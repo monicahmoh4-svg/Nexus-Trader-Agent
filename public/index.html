@@ -703,12 +703,19 @@ window.onerror = function(msg,src,line){
 // App ID 1089 is Deriv's official public app -- works for all tokens.
 // To use your own App ID: go to https://developers.deriv.com,
 // register an app with Read + Trade scopes, then replace 1089 below.
-const DERIV_APP_ID = 1089;
+// Deriv App ID — registered at developers.deriv.com
+// App ID 36544 is the official Deriv SmartTrader app ID (public, always works)
+// If you register your own app, replace this value
+const DERIV_APP_ID = 36544;
+const DERIV_BRAND = 'deriv';
 const WS_ENDPOINTS = [
-  'wss://ws.derivws.com/websockets/v3?app_id=' + DERIV_APP_ID,
-  'wss://ws.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID,
-  'wss://frontend.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID,
+  'wss://ws.derivws.com/websockets/v3?app_id=' + DERIV_APP_ID + '&l=EN&brand=' + DERIV_BRAND,
+  'wss://ws.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID + '&l=EN&brand=' + DERIV_BRAND,
 ];
+// OAuth redirect URI — must match what you registered at developers.deriv.com
+const OAUTH_REDIRECT = window.location.origin + window.location.pathname;
+const OAUTH_URL = 'https://oauth.deriv.com/oauth2/authorize?app_id=' + DERIV_APP_ID +
+  '&l=EN&brand=' + DERIV_BRAND + '&redirect_uri=' + encodeURIComponent(OAUTH_REDIRECT);
 const MAX_TRADES = 5;
 const TICK_SYMS = ['1HZ50V','1HZ75V','1HZ100V','BOOM500','CRASH500','frxEURUSD','frxGBPUSD','frxXAUUSD','cryBTCUSD','JD100'];
 const SYMS = {
@@ -812,23 +819,40 @@ var API = (function(){
   var ws=null,token=null,reqId=1,pingInt=null,reconnTimer=null,reconnAttempts=0,wsIdx=0;
   var pending={},tickSubs={},tickPrices={};
 
-  function connect(t,type){
+function connect(t,type){
     type=type||'demo';
-    // Clean token: remove whitespace, BOM, zero-width chars, quotes only
-    token=(t||'').replace(/[\u200B-\u200D\uFEFF]/g,'') // zero-width
-                 .replace(/[\s]/g,'')                      // all whitespace
-                 .replace(/^['"]+|['"]+$/g,'')              // leading/trailing quotes
-                 .trim();
-    if(!token||token.length<8){
-      _toast('Invalid Token','Please copy your token from app.deriv.com > Account Settings > API Token','e',7000);
+    // Clean token — remove all invisible/whitespace characters
+    token=(t||'')
+      .replace(/[\u200B-\u200D\uFEFF\u00A0]/g,'')
+      .replace(/[\r\n\t\s]/g,'')
+      .replace(/^['"]+|['"]+$/g,'')
+      .trim();
+    if(!token || token.length<8){
+      _toast('Invalid Token',
+        'Token too short or empty. Get yours from:\napp.deriv.com > Account Settings > API Token\nEnable READ + TRADE scopes',
+        'e', 9000);
       return;
     }
-    console.log('[API] connect() called | type:',type,'| token length:',token.length,'| first 6 chars:',token.substring(0,6));
-    S.accountType=type;S.connected=false;S.balance=0;S.currency='USD';
-    S.loginid='';S.wins=0;S.losses=0;S.todayPnl=0;S.activeTrades=0;
+    // Validate token format — Deriv tokens are alphanumeric, typically 15+ chars
+    if(!/^[a-zA-Z0-9_-]+$/.test(token)){
+      _toast('Invalid Token',
+        'Token contains invalid characters. Copy it directly from Deriv without extra spaces.',
+        'e', 7000);
+      return;
+    }
+    S.accountType=type;
+    S.connected=false;
+    S.balance=0;
+    S.currency='USD';
+    S.loginid='';
+    S.wins=0;
+    S.losses=0;
+    S.todayPnl=0;
+    S.activeTrades=0;
     S._authFailed=false;
-    reconnAttempts=0;wsIdx=0;
-    console.log('[API] connect type:',type,'token[:6]:',token.substring(0,6));
+    reconnAttempts=0;
+    wsIdx=0;
+    console.log('[API] Connecting | type:', type, '| token length:', token.length, '| first 6:', token.substring(0,6));
     _setStatus('connecting');
     _open();
   }
@@ -853,22 +877,34 @@ var API = (function(){
       console.log('[WS] open - authorizing...');
       setTimeout(function(){
         _send({authorize:token},function(r){
-          if(r.error){
-            var code=r.error.code||'';
-            var msg=r.error.message||'Auth failed';
-            var hint=msg;
-            if(code==='InvalidToken'||msg.toLowerCase().indexOf('invalid token')>=0){
-              hint='Invalid token. Steps: 1) Go to app.deriv.com 2) Log into the correct account (Demo or Real) 3) Account Settings > API Token 4) Create new token with Read + Trade enabled 5) Copy the full token and paste here';
-            } else if(code==='DisabledClient'){
-              hint='Your Deriv account has been disabled. Contact Deriv support.';
-            } else if(msg.toLowerCase().indexOf('app')>=0){
-              hint='App ID error: '+msg+'. Try refreshing the page.';
+       if(r.error){
+            var code = r.error.code || '';
+            var msg  = r.error.message || 'Authorization failed';
+            var hint = '';
+            console.error('[API] Auth error | code:', code, '| message:', msg);
+            if(code === 'InvalidToken' || msg.toLowerCase().indexOf('invalid') >= 0){
+              hint = 'Token is invalid or expired. To fix:\n' +
+                '1. Go to app.deriv.com\n' +
+                '2. Make sure you are on the correct account (Demo OR Real)\n' +
+                '3. Go to Account Settings > API Token\n' +
+                '4. Create a NEW token with READ + TRADE permissions\n' +
+                '5. Copy the FULL token and paste it here\n\n' +
+                'Note: Each account (Demo/Real) has its own token.';
+            } else if(code === 'InvalidAppID'){
+              hint = 'App ID error. Please refresh the page and try again.';
+            } else if(code === 'RateLimit'){
+              hint = 'Too many connection attempts. Please wait 30 seconds and try again.';
+            } else if(code === 'DisabledClient'){
+              hint = 'Your Deriv account is disabled. Please contact Deriv support.';
+            } else if(code === 'AuthorizationRequired'){
+              hint = 'Authorization required. Please check your token has READ + TRADE permissions.';
+            } else {
+              hint = msg + '\n\nIf this persists, try creating a new API token at app.deriv.com';
             }
-            console.error('[API] Auth error | code:',code,'| message:',msg);
-            S._authFailed=true;
-            _toast('Connection Failed',hint,'e',10000);
+            S._authFailed = true;
+            _toast('Connection Failed', hint, 'e', 12000);
             _setStatus('disconnected');
-            token=null;
+            token = null;
             return;
           }
           var a=r.authorize;
@@ -2101,11 +2137,18 @@ var Bots = (function(){
 // ── Auth ──────────────────────────────────────────────────
 var Auth = (function(){
   var _type='demo';
-  function show(){
-    _type='demo';_setModalType('demo');
+function show(){
+    _type='demo';
+    _setModalType('demo');
     $('tokenIn').value='';
     $('authModal').style.display='flex';
-    setTimeout(function(){$('tokenIn').focus();},100);
+    setTimeout(function(){
+      var ti=$('tokenIn');if(ti)ti.focus();
+    },100);
+  }
+  // Expose _checkOAuthCallback so boot can call it
+  function _checkOAuthCallbackPublic(){
+    return typeof _checkOAuthCallback==='function'?_checkOAuthCallback():false;
   }
   function close(){$('authModal').style.display='none';}
   function _setModalType(t){
@@ -2149,19 +2192,51 @@ var Auth = (function(){
     },150);
   }
   function oauth(){
-    var url='https://oauth.deriv.com/oauth2/authorize?app_id='+DERIV_APP_ID+'&l=EN&brand=deriv';
-    var win=window.open(url,'_blank','width=640,height=720,left=200,top=80');
-    _toast('Opening OAuth','Approve access in the popup','i');
-    var chk=setInterval(function(){
-      try{
-        if(win&&win.closed){clearInterval(chk);return;}
-        var p=new URLSearchParams(win.location.search);
-        var tk=p.get('token1')||p.get('token');
-        if(tk){clearInterval(chk);win.close();$('tokenIn').value=tk;connect();}
-      }catch(e){}
-    },600);
+    // Check if we already have OAuth tokens in the URL (redirect callback)
+    _checkOAuthCallback();
+    // Open Deriv OAuth page
+    _toast('Opening Deriv OAuth...','You will be redirected back automatically after login','i',4000);
+    // Use redirect flow — opens in same tab so redirect works properly
+    window.location.href = OAUTH_URL;
   }
-  return{show:show,close:close,switchType:switchType,connect:connect,oauth:oauth};
+
+  function _checkOAuthCallback(){
+    // Deriv redirects back with ?acct1=...&token1=...&cur1=...
+    var params = new URLSearchParams(window.location.search);
+    var token = params.get('token1') || params.get('token');
+    var acct  = params.get('acct1')  || params.get('acct');
+    var cur   = params.get('cur1')   || params.get('cur');
+    if(token && token.length > 8){
+      console.log('[OAuth] Callback detected | acct:', acct, '| currency:', cur);
+      // Clean URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+      // Store token and type
+      $('tokenIn').value = token;
+      // Determine account type from account prefix
+      // Deriv virtual accounts start with VRTC, real accounts start with CR/MF/MLT etc.
+      var isDemo = acct && (acct.startsWith('VRTC') || acct.startsWith('VRT'));
+      _type = isDemo ? 'demo' : 'real';
+      console.log('[OAuth] Account:', acct, '| type:', _type);
+      _setModalType(_type);
+      // Auto-connect
+      setTimeout(function(){
+        _toast('OAuth Success!','Connecting ' + _type.toUpperCase() + ' account: ' + (acct||''), 's', 4000);
+        connect();
+      }, 500);
+      return true;
+    }
+    return false;
+  }
+ return{
+    show:show,
+    close:close,
+    switchType:switchType,
+    connect:connect,
+    oauth:oauth,
+    _checkOAuthCallback: function(){
+      return _checkOAuthCallback ? _checkOAuthCallback() : false;
+    }
+  };
 })();
 
 // ── Dashboard ─────────────────────────────────────────────
@@ -2593,9 +2668,17 @@ window.addEventListener('DOMContentLoaded',function(){
       }catch(e2){console.error('[Boot] Emergency wire failed:',e2.message);}
     },100);
   }
-  // Step 5: Show auth modal
+  // Step 5: Check for OAuth callback first, show modal if no callback
   setTimeout(function(){
-    try{Auth.show();}catch(e){console.error('[Boot] Auth.show failed:',e.message);}
+    try{
+      var hasCallback = Auth._checkOAuthCallback ? Auth._checkOAuthCallback() : false;
+      if(!hasCallback){
+        Auth.show();
+      }
+    }catch(e){
+      console.error('[Boot] Auth.show failed:',e.message);
+      try{Auth.show();}catch(e2){}
+    }
   },500);
   // Step 6: Keep toggles in sync
   setInterval(function(){
