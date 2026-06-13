@@ -703,19 +703,15 @@ window.onerror = function(msg,src,line){
 // App ID 1089 is Deriv's official public app -- works for all tokens.
 // To use your own App ID: go to https://developers.deriv.com,
 // register an app with Read + Trade scopes, then replace 1089 below.
-// Deriv App ID — registered at developers.deriv.com
-// App ID 36544 is the official Deriv SmartTrader app ID (public, always works)
-// If you register your own app, replace this value
-const DERIV_APP_ID = 36544;
-const DERIV_BRAND = 'deriv';
+// Deriv App ID 16929 - valid public app that accepts API tokens
+// created at app.deriv.com/account/api-token
+// To use your own app: register at developers.deriv.com
+const DERIV_APP_ID = 16929;
 const WS_ENDPOINTS = [
-  'wss://ws.derivws.com/websockets/v3?app_id=' + DERIV_APP_ID + '&l=EN&brand=' + DERIV_BRAND,
-  'wss://ws.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID + '&l=EN&brand=' + DERIV_BRAND,
+  'wss://ws.derivws.com/websockets/v3?app_id=' + DERIV_APP_ID,
+  'wss://ws.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID,
+  'wss://frontend.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID,
 ];
-// OAuth redirect URI — must match what you registered at developers.deriv.com
-const OAUTH_REDIRECT = window.location.origin + window.location.pathname;
-const OAUTH_URL = 'https://oauth.deriv.com/oauth2/authorize?app_id=' + DERIV_APP_ID +
-  '&l=EN&brand=' + DERIV_BRAND + '&redirect_uri=' + encodeURIComponent(OAUTH_REDIRECT);
 const MAX_TRADES = 5;
 const TICK_SYMS = ['1HZ50V','1HZ75V','1HZ100V','BOOM500','CRASH500','frxEURUSD','frxGBPUSD','frxXAUUSD','cryBTCUSD','JD100'];
 const SYMS = {
@@ -819,167 +815,176 @@ var API = (function(){
   var ws=null,token=null,reqId=1,pingInt=null,reconnTimer=null,reconnAttempts=0,wsIdx=0;
   var pending={},tickSubs={},tickPrices={};
 
-function connect(t,type){
-    type=type||'demo';
-    // Clean token — remove all invisible/whitespace characters
-    token=(t||'')
-      .replace(/[\u200B-\u200D\uFEFF\u00A0]/g,'')
-      .replace(/[\r\n\t\s]/g,'')
-      .replace(/^['"]+|['"]+$/g,'')
+  function connect(t,type){
+    type = type||'demo';
+    // Aggressive token cleaning
+    token = (t||'')
+      .replace(/[\u200B-\u200D\uFEFF\u00A0\u00AD]/g,'')
+      .replace(/[\r\n\t]/g,'')
+      .replace(/\s/g,'')
+      .replace(/^['"\s]+|['"\s]+$/g,'')
       .trim();
-    if(!token || token.length<8){
-      _toast('Invalid Token',
-        'Token too short or empty. Get yours from:\napp.deriv.com > Account Settings > API Token\nEnable READ + TRADE scopes',
-        'e', 9000);
+    if(!token || token.length < 5){
+      _toast('Token Required',
+        'Please paste your Deriv API token.\n\nGet it from: app.deriv.com > Account Settings > API Token\nEnable: Read + Trade',
+        'e', 8000);
       return;
     }
-    // Validate token format — Deriv tokens are alphanumeric, typically 15+ chars
-    if(!/^[a-zA-Z0-9_-]+$/.test(token)){
-      _toast('Invalid Token',
-        'Token contains invalid characters. Copy it directly from Deriv without extra spaces.',
-        'e', 7000);
-      return;
-    }
-    S.accountType=type;
-    S.connected=false;
-    S.balance=0;
-    S.currency='USD';
-    S.loginid='';
-    S.wins=0;
-    S.losses=0;
-    S.todayPnl=0;
-    S.activeTrades=0;
-    S._authFailed=false;
-    reconnAttempts=0;
-    wsIdx=0;
-    console.log('[API] Connecting | type:', type, '| token length:', token.length, '| first 6:', token.substring(0,6));
+    S.accountType = type;
+    S.connected   = false;
+    S.balance     = 0;
+    S.currency    = 'USD';
+    S.loginid     = '';
+    S.wins = 0; S.losses = 0; S.todayPnl = 0; S.activeTrades = 0;
+    S._authFailed = false;
+    reconnAttempts = 0;
+    wsIdx = 0;
+    console.log('[API] connect | type:', type, '| tokenLen:', token.length, '| first8:', token.substring(0,8));
     _setStatus('connecting');
     _open();
   }
 
   function _open(){
-    if(ws){try{ws.onopen=null;ws.onmessage=null;ws.onerror=null;ws.onclose=null;ws.close();}catch(e){}}
-    ws=null;_setStatus('connecting');
-    var ep=WS_ENDPOINTS[wsIdx%WS_ENDPOINTS.length];
-    console.log('[WS] connecting to',ep);
+    if(ws){
+      try{ws.onopen=null;ws.onmessage=null;ws.onerror=null;ws.onclose=null;ws.close();}catch(e){}
+    }
+    ws = null;
+    _setStatus('connecting');
+    var ep = WS_ENDPOINTS[wsIdx % WS_ENDPOINTS.length];
+    console.log('[WS] Connecting to:', ep);
     var connTimeout;
-    try{ws=new WebSocket(ep);}
-    catch(e){_toast('Connection Error','Cannot open WebSocket','e');_setStatus('disconnected');return;}
-    connTimeout=setTimeout(function(){
-      if(!ws||ws.readyState!==1){
+    try{ ws = new WebSocket(ep); }
+    catch(e){
+      _toast('Connection Error','Cannot open WebSocket. Check internet.','e');
+      _setStatus('disconnected');
+      return;
+    }
+    connTimeout = setTimeout(function(){
+      if(!ws || ws.readyState !== 1){
+        console.warn('[WS] Timeout, trying next endpoint');
         wsIdx++;
-        if(wsIdx<WS_ENDPOINTS.length){_toast('Retrying...','Trying alternate server','i');_open();}
-        else{_toast('Connection Failed','Cannot reach Deriv servers. Check your internet connection and try again.','e',8000);_setStatus('disconnected');}
+        if(wsIdx < WS_ENDPOINTS.length){
+          _toast('Retrying...','Trying alternate server...','i',2000);
+          _open();
+        } else {
+          _toast('Cannot Connect','Deriv servers unreachable. Check internet.','e',8000);
+          _setStatus('disconnected');
+        }
       }
-    },10000);
-    ws.onopen=function(){
-      clearTimeout(connTimeout);reconnAttempts=0;wsIdx=0;_startPing();
-      console.log('[WS] open - authorizing...');
-      setTimeout(function(){
-        _send({authorize:token},function(r){
-       if(r.error){
-            var code = r.error.code || '';
-            var msg  = r.error.message || 'Authorization failed';
-            var hint = '';
-            console.error('[API] Auth error | code:', code, '| message:', msg);
-            if(code === 'InvalidToken' || msg.toLowerCase().indexOf('invalid') >= 0){
-              hint = 'Token is invalid or expired. To fix:\n' +
-                '1. Go to app.deriv.com\n' +
-                '2. Make sure you are on the correct account (Demo OR Real)\n' +
-                '3. Go to Account Settings > API Token\n' +
-                '4. Create a NEW token with READ + TRADE permissions\n' +
-                '5. Copy the FULL token and paste it here\n\n' +
-                'Note: Each account (Demo/Real) has its own token.';
-            } else if(code === 'InvalidAppID'){
-              hint = 'App ID error. Please refresh the page and try again.';
-            } else if(code === 'RateLimit'){
-              hint = 'Too many connection attempts. Please wait 30 seconds and try again.';
-            } else if(code === 'DisabledClient'){
-              hint = 'Your Deriv account is disabled. Please contact Deriv support.';
-            } else if(code === 'AuthorizationRequired'){
-              hint = 'Authorization required. Please check your token has READ + TRADE permissions.';
-            } else {
-              hint = msg + '\n\nIf this persists, try creating a new API token at app.deriv.com';
-            }
-            S._authFailed = true;
-            _toast('Connection Failed', hint, 'e', 12000);
-            _setStatus('disconnected');
-            token = null;
-            return;
+    }, 12000);
+
+    ws.onopen = function(){
+      clearTimeout(connTimeout);
+      reconnAttempts = 0;
+      wsIdx = 0;
+      _startPing();
+      console.log('[WS] Open. Sending authorize...');
+      // Send authorize immediately on open
+      _send({authorize: token}, function(r){
+        if(r.error){
+          var code = r.error.code||'';
+          var msg  = r.error.message||'Unknown error';
+          console.error('[API] Auth error | code:', code, '| msg:', msg);
+          S._authFailed = true;
+          var hint = '';
+          if(code === 'InvalidToken' || code === 'InvalidAppID' ||
+             msg.toLowerCase().indexOf('invalid') >= 0 ||
+             msg.toLowerCase().indexOf('expired') >= 0){
+            hint = 'Token rejected by Deriv. Steps to fix:\n' +
+              '1) Open app.deriv.com in your browser\n' +
+              '2) Log in to the account you want to use\n' +
+              '3) Go to: Account Settings > API Token\n' +
+              '4) Delete old tokens, create NEW token\n' +
+              '5) Enable READ + TRADE permissions\n' +
+              '6) Copy the token EXACTLY and paste it here\n\n' +
+              'Error: ' + msg;
+          } else if(code === 'RateLimit'){
+            hint = 'Too many attempts. Wait 60 seconds then try again.';
+          } else if(code === 'DisabledClient'){
+            hint = 'Account disabled. Contact Deriv support.';
+          } else {
+            hint = msg + ' (code: ' + code + ')';
           }
-          var a=r.authorize;
-          var isVirtual=a.is_virtual===1||a.is_virtual==='1'||a.is_virtual===true;
-          S.accountType=isVirtual?'demo':'real';
-          var rawBal=a.balance;
-          S.balance=rawBal!=null?parseFloat(String(rawBal).replace(/,/g,''))||0:0;
-          S.currency=a.currency||'USD';
-          S.loginid=a.loginid||'';
-          S.connected=true;S.activeTrades=0;
-          console.log('[API] auth OK:',S.loginid,'type:',S.accountType,'bal:',S.balance,S.currency);
-          _setStatus('connected');_updateBal();_updateMetrics();
-          _send({balance:1,subscribe:1},function(br){
-            if(!br.error&&br.balance){
-              S.balance=parseFloat(String(br.balance.balance).replace(/,/g,''))||S.balance;
-              S.currency=br.balance.currency||S.currency;
-              _updateBal();_updateMetrics();
-            }
-          });
-          _send({transaction:1,subscribe:1});
-          _send({balance:1},function(br2){
-            if(!br2.error&&br2.balance){
-              S.balance=parseFloat(String(br2.balance.balance).replace(/,/g,''))||S.balance;
-              S.currency=br2.balance.currency||S.currency;
-              _updateBal();_updateMetrics();
-            }
-          });
-          _send({portfolio:1},function(pr){
-            if(!pr.error)(pr.portfolio.contracts||[]).forEach(function(c){
-              _send({proposal_open_contract:1,contract_id:c.contract_id,subscribe:1});
+          _toast('Auth Failed', hint, 'e', 15000);
+          _setStatus('disconnected');
+          token = null;
+          return;
+        }
+        // Auth success
+        var a = r.authorize;
+        var isVirtual = (a.is_virtual === 1 || a.is_virtual === '1' || a.is_virtual === true);
+        S.accountType = isVirtual ? 'demo' : 'real';
+        S.balance  = a.balance != null ? parseFloat(String(a.balance).replace(/,/g,''))||0 : 0;
+        S.currency = a.currency || 'USD';
+        S.loginid  = a.loginid  || '';
+        S.connected = true;
+        S.activeTrades = 0;
+        console.log('=== AUTH SUCCESS ===');
+        console.log('LoginID  :', S.loginid);
+        console.log('Type     :', S.accountType, '(is_virtual=' + a.is_virtual + ')');
+        console.log('Balance  :', S.balance, S.currency);
+        console.log('Real     :', S.accountType === 'real' ? 'YES' : 'NO');
+        console.log('===================');
+        _setStatus('connected');
+        _updateBal();
+        _updateMetrics();
+        // Subscribe to live balance stream
+        _send({balance:1, subscribe:1}, function(br){
+          if(!br.error && br.balance){
+            S.balance  = parseFloat(String(br.balance.balance).replace(/,/g,''))||S.balance;
+            S.currency = br.balance.currency || S.currency;
+            _updateBal(); _updateMetrics();
+          }
+        });
+        // Subscribe to transaction stream
+        _send({transaction:1, subscribe:1});
+        // Confirm balance with direct request
+        setTimeout(function(){ requestFreshBalance(); }, 1500);
+        // Load open contracts
+        _send({portfolio:1}, function(pr){
+          if(!pr.error){
+            (pr.portfolio.contracts||[]).forEach(function(c){
+              _send({proposal_open_contract:1, contract_id:c.contract_id, subscribe:1});
               S.activeTrades++;
             });
-            _updateMetrics();
-          });
-          Ticker.start();Dashboard.init();
-          var acctLabel = S.accountType==='real' ? 'REAL MONEY ACCOUNT' : 'Demo Account';
-          _toast('Connected: '+acctLabel,
-            S.loginid+' | '+S.currency+' '+S.balance.toFixed(2)+
-            (S.accountType==='real'?' | All trades are REAL':''),
-            's',8000);
-          console.log('====================================');
-          console.log('NEXUS TRADE -- Connected to Deriv');
-          console.log('Login ID:    ', S.loginid);
-          console.log('Account type:', S.accountType, '(is_virtual from Deriv)');
-          console.log('Balance:     ', S.balance, S.currency);
-          console.log('Real trades: ', S.accountType==='real' ? 'YES -- affects real funds' : 'NO -- demo only');
-          console.log('====================================');
-          setTimeout(function(){AE.warmup();},800);
-          setTimeout(function(){_updateBal();_updateMetrics();},1500);
+          }
+          _updateMetrics();
         });
-      },300);
+        Ticker.start();
+        Dashboard.init();
+        var label = S.accountType === 'real' ? 'REAL ACCOUNT' : 'Demo Account';
+        _toast('Connected: ' + label,
+          S.loginid + ' | ' + S.currency + ' ' + S.balance.toFixed(2) +
+          (S.accountType==='real' ? ' | REAL FUNDS' : ''),
+          's', 8000);
+        setTimeout(function(){ AE.warmup(); }, 800);
+        setTimeout(function(){ _updateBal(); _updateMetrics(); }, 3000);
+      });
     };
-    ws.onmessage=function(e){try{_handle(JSON.parse(e.data));}catch(err){console.error('[WS parse]',err);}};
-    ws.onerror=function(e){console.error('[WS error]',e);};
-    ws.onclose=function(e){
-      clearTimeout(connTimeout);_stopPing();
-      console.log('[WS] closed | code:',e.code,'| reason:',e.reason,'| wasClean:',e.wasClean);
+
+    ws.onmessage = function(e){
+      try{ _handle(JSON.parse(e.data)); }
+      catch(err){ console.error('[WS parse]', err); }
+    };
+    ws.onerror = function(e){ console.error('[WS error]', e); };
+    ws.onclose = function(e){
+      clearTimeout(connTimeout);
+      _stopPing();
+      console.log('[WS] Closed | code:', e.code, 'clean:', e.wasClean);
       if(S.connected){
-        // Was connected, lost connection -- try to reconnect
-        S.connected=false;
+        S.connected = false;
         _setStatus('disconnected');
-        _toast('Connection lost','Reconnecting to Deriv...','i');
+        _toast('Disconnected','Lost connection. Reconnecting...','i',3000);
         _schedReconn();
       } else if(token && !S._authFailed){
-        // Connection closed before auth -- try next endpoint
         wsIdx++;
-        if(wsIdx<WS_ENDPOINTS.length){
-          console.log('[WS] Trying next endpoint...');
-          setTimeout(function(){_open();},1500);
+        if(wsIdx < WS_ENDPOINTS.length){
+          setTimeout(function(){ _open(); }, 1500);
         } else {
-          wsIdx=0;
+          wsIdx = 0;
           _schedReconn();
         }
       } else {
-        // Auth failed -- don't reconnect, show error
         _setStatus('disconnected');
       }
     };
@@ -1466,51 +1471,19 @@ var AE = (function(){
       patterns:[],bullScore:50,bearScore:50,timestamp:Date.now()};
   }
 
- function quick(sym){return analyse(sym).catch(function(e){return _mock(sym,e.message);});}
-
-  // Pre-fetch latest analysis for a symbol and cache it
-  // Returns cached result if fresh enough (< 8 seconds old)
-  var _quickCache = {};
-  function quickCached(sym){
-    var now = Date.now();
-    var cached = _quickCache[sym];
-    if(cached && (now - cached.timestamp) < 8000){
-      return Promise.resolve(cached);
-    }
-    return analyse(sym).then(function(r){
-      _quickCache[sym] = r;
-      return r;
-    }).catch(function(e){ return _mock(sym,e.message); });
-  }
+  function quick(sym){return analyse(sym).catch(function(e){return _mock(sym,e.message);});}
 
   function warmup(){
-    console.log('[AE] Warming up all',ALL_SCAN_SYMS.length,'symbols...');
-    // Subscribe live ticks for ALL symbols immediately
-    ALL_SCAN_SYMS.forEach(function(s,i){
-      setTimeout(function(){ _sub(s); }, i * 80);
-    });
-    // Pre-load tick history for priority symbols immediately
-    var priority = [
-      '1HZ50V','1HZ75V','1HZ25V','1HZ100V',
-      'BOOM500','CRASH500','frxEURUSD','frxGBPUSD',
-      'frxXAUUSD','JD100','R_50','BOOM1000'
-    ];
+    console.log('[AE] warming up',ALL_SCAN_SYMS.length,'symbols');
+    ALL_SCAN_SYMS.forEach(function(s,i){setTimeout(function(){_sub(s);},i*100);});
     setTimeout(function(){
-      priority.forEach(function(s,i){
-        setTimeout(function(){ _load(s).catch(function(){}); }, i * 300);
+      ['1HZ50V','1HZ75V','1HZ25V','BOOM500','CRASH500','frxEURUSD','frxXAUUSD'].forEach(function(s,i){
+        setTimeout(function(){_load(s).catch(function(){});},i*500);
       });
-    }, 2000);
-    // Load remaining symbols after 15 seconds
-    setTimeout(function(){
-      ALL_SCAN_SYMS.forEach(function(s,i){
-        if(priority.indexOf(s) < 0){
-          setTimeout(function(){ _load(s).catch(function(){}); }, i * 200);
-        }
-      });
-    }, 15000);
+    },5000);
   }
 
-  return{analyse:analyse,quick:quick,quickCached:quickCached,warmup:warmup,ALL_SCAN_SYMS:ALL_SCAN_SYMS,_cache:_cache,_load:_load};
+  return{analyse:analyse,quick:quick,warmup:warmup,ALL_SCAN_SYMS:ALL_SCAN_SYMS,_cache:_cache,_load:_load};
 })();
 
 // ── Trade Feed ────────────────────────────────────────────
@@ -1702,277 +1675,81 @@ var Trader = (function(){
     }
   }
 
-// ── Market scoring weights for profit-first selection ──
-  var MARKET_SCORES = {}; // tracks per-symbol win history
-  var SCAN_INTERVAL = 1500; // ms between scans — fast continuous loop
-
   function _startLoop(){
-    clearTimeout(S.autoTimer);
-    clearInterval(S.autoInterval);
-    S._loopRunning = false;
-    S._scanCycle = 0;
-    _toast('Auto-Trading ON','Scanning all '+AE.ALL_SCAN_SYMS.length+' markets continuously...','s',4000);
-    console.log('[Loop] Starting continuous scan loop on',AE.ALL_SCAN_SYMS.length,'markets');
-
+    clearTimeout(S.autoTimer);S._loopRunning=false;
+    _toast('Scanning Markets...','Analysing all markets - will execute when favourable','i');
     function tick(){
-      if(!S.autoTrade){ S._loopRunning=false; console.log('[Loop] Stopped'); return; }
-      if(!S.connected){ S.autoTimer=setTimeout(tick,2000); return; }
-      S._loopRunning = true;
-      S._scanCycle = (S._scanCycle||0) + 1;
-
-      // ── Daily limit guards ──────────────────────────────
-      var tp = parseFloat(($('cfgTP')&&$('cfgTP').value)||'0')||0;
-      var sl = parseFloat(($('cfgSL')&&$('cfgSL').value)||'0')||0;
-      if(tp>0 && S.todayPnl>=tp){
-        toggleAuto();
-        _toast('Daily Target Hit!','Take profit $'+tp+' reached — auto-trading stopped','s',8000);
-        return;
-      }
-      if(sl>0 && S.todayPnl<=-sl){
-        toggleAuto(); Bots.stopAll();
-        _toast('Daily Loss Limit!','Stop loss -$'+sl+' reached — all trading stopped','e',8000);
-        return;
-      }
-
-      // ── Max concurrent trades guard ─────────────────────
-      if(S.activeTrades >= MAX_TRADES){
-        S.autoTimer = setTimeout(tick, 1500);
-        return;
-      }
-
-      // ── Check manual rules first ────────────────────────
-      var rule = _getRule();
-      if(rule){
-        _execRule(rule).catch(function(e){ console.warn('[Rule]',e.message); }).then(function(){
-          if(S.autoTrade) S.autoTimer = setTimeout(tick, SCAN_INTERVAL);
-        });
-        return;
-      }
-
-      // ── Run continuous market scan ──────────────────────
-      _autoTrade().catch(function(e){
-        console.warn('[AutoTrade]',e.message);
-      }).then(function(){
-        if(S.autoTrade){
-          // Reschedule immediately — no long wait
-          var delay = S.activeTrades > 0 ? 2000 : SCAN_INTERVAL;
-          S.autoTimer = setTimeout(tick, delay);
-        }
+      if(!S.autoTrade){S._loopRunning=false;return;}
+      if(!S.connected){S.autoTimer=setTimeout(tick,3000);return;}
+      S._loopRunning=true;
+      var tp=parseFloat($('cfgTP')?$('cfgTP').value:'0')||0;
+      var sl=parseFloat($('cfgSL')?$('cfgSL').value:'0')||0;
+      if(tp>0&&S.todayPnl>=tp){toggleAuto();_toast('Take Profit!','+$'+S.todayPnl.toFixed(2)+' reached','s');return;}
+      if(sl>0&&S.todayPnl<=-sl){toggleAuto();Bots.stopAll();_toast('Stop Loss!','-$'+Math.abs(S.todayPnl).toFixed(2)+' reached','e');return;}
+      if(S.activeTrades>=MAX_TRADES){S.autoTimer=setTimeout(tick,3000);return;}
+      var rule=_getRule();
+      var p=rule?_execRule(rule).catch(function(e){console.warn('[Rule]',e.message);}):_autoTrade().catch(function(e){console.warn('[AutoTrade]',e.message);});
+      p.then(function(){
+        if(S.autoTrade){var d=S.activeTrades>0?4000:2000;S.autoTimer=setTimeout(tick,d);}
       });
     }
-
-    // Start IMMEDIATELY — first scan right away
     tick();
   }
-function _autoTrade(){
-    var thresh = parseInt(($('cfgConf')&&$('cfgConf').value)||'62')||62;
-    var stake  = parseFloat(($('cfgStake')&&$('cfgStake').value)||'1')||1;
-    var scanList = AE.ALL_SCAN_SYMS;
 
-    // ── Scan all markets in small fast batches ──────────
-    var BATCH = 6;
-    var allResults = [];
-    var batchIdx = 0;
-
-    function runBatch(){
-      if(batchIdx >= scanList.length) return Promise.resolve(allResults);
-      var batch = scanList.slice(batchIdx, batchIdx + BATCH);
-      batchIdx += BATCH;
-  return Promise.all(batch.map(function(sym){
-        return AE.quickCached(sym).catch(function(){ return null; });
-      })).then(function(res){
-        res.forEach(function(r){ if(r && r.currentPrice > 0) allResults.push(r); });
-        // Small gap between batches to avoid WS flood
-        return new Promise(function(resolve){ setTimeout(function(){ resolve(runBatch()); }, 80); });
-      });
+  function _autoTrade(){
+    var thresh=parseInt($('cfgConf')?$('cfgConf').value:'62')||62;
+    var stake=parseFloat($('cfgStake')?$('cfgStake').value:'1')||1;
+    var scanList=AE.ALL_SCAN_SYMS;
+    console.log('[AutoTrade] scanning',scanList.length,'markets threshold:',thresh+'%');
+    var BATCH=8,allR=[],idx=0;
+    function nextBatch(){
+      if(idx>=scanList.length){
+        return Promise.resolve(allR);
+      }
+      var batch=scanList.slice(idx,idx+BATCH);idx+=BATCH;
+      return Promise.all(batch.map(function(s){return AE.quick(s).catch(function(){return null;});}))
+        .then(function(res){
+          res.forEach(function(r){if(r)allR.push(r);});
+          return new Promise(function(resolve){setTimeout(function(){resolve(nextBatch());},250);});
+        });
     }
-
-    return runBatch().then(function(){
-      console.log('[AutoTrade] Cycle #'+S._scanCycle+' | Scanned:',allResults.length,'| Threshold:',thresh+'%');
-
-      // ── Filter: must be clear direction + meet confidence ──
-      var candidates = allResults.filter(function(r){
-        return r.direction !== 'NEUTRAL'
-          && r.confidence >= thresh
-          && r.currentPrice > 0;
+    return nextBatch().then(function(results){
+      console.log('[AutoTrade] scanned',results.length,'finding best signal...');
+      var valid=results.filter(function(a){return a&&a.direction!=='NEUTRAL'&&a.confidence>=thresh&&a.currentPrice>0;});
+      valid.sort(function(a,b){
+        var pw=function(p){return p==='HIGH'?1.3:p==='MEDIUM'?1.1:1;};
+        return(b.confidence*pw(b.projectedProfit))-(a.confidence*pw(a.projectedProfit));
       });
-
-      if(!candidates.length){
-        console.log('[AutoTrade] No qualifying signals at',thresh+'% — continuing scan...');
+      if(!valid.length){
+        console.log('[AutoTrade] no signals >= threshold',thresh);
+        _toast('Scanning...','No qualifying signal across '+results.length+' markets - rescanning','i',2500);
         return;
       }
-
-      // ── Advanced profit-first scoring ────────────────────
-      // Score combines: confidence, trend alignment, MACD alignment,
-      // projected profit, digit bias strength, and historical win rate
-      candidates.forEach(function(r){
-        var score = r.confidence;
-
-        // Bonus: projected profit rating
-        if(r.projectedProfit === 'HIGH')   score += 15;
-        if(r.projectedProfit === 'MEDIUM') score += 7;
-
-        // Bonus: trend and direction aligned
-        var trend = r.indicators && r.indicators.trend;
-        if(trend){
-          if(r.direction==='BUY'  && trend.direction==='uptrend')   score += 10;
-          if(r.direction==='SELL' && trend.direction==='downtrend')  score += 10;
-          score += Math.min(trend.strength||0, 20) * 0.3;
-        }
-
-        // Bonus: MACD confirms direction
-        var macd = r.indicators && r.indicators.macd;
-        if(macd){
-          if(r.direction==='BUY'  && macd.bullish)  score += 8;
-          if(r.direction==='SELL' && !macd.bullish) score += 8;
-          if(macd.crossUp   && r.direction==='BUY')  score += 12;
-          if(macd.crossDown && r.direction==='SELL') score += 12;
-        }
-
-        // Bonus: RSI in favourable zone
-        var rsi = r.indicators && r.indicators.rsi;
-        if(rsi !== null && rsi !== undefined){
-          if(r.direction==='BUY'  && rsi < 35)  score += 10;
-          if(r.direction==='BUY'  && rsi < 45)  score += 5;
-          if(r.direction==='SELL' && rsi > 65)  score += 10;
-          if(r.direction==='SELL' && rsi > 55)  score += 5;
-        }
-
-        // Bonus: Bollinger band confirmation
-        var bb = r.indicators && r.indicators.bb;
-        if(bb){
-          if(r.direction==='BUY'  && bb.belowLower)  score += 12;
-          if(r.direction==='BUY'  && bb.nearLower)   score += 6;
-          if(r.direction==='SELL' && bb.aboveUpper)  score += 12;
-          if(r.direction==='SELL' && bb.nearUpper)   score += 6;
-        }
-
-        // Bonus: Stochastic crossover in extreme zone
-        var stoch = r.indicators && r.indicators.stoch;
-        if(stoch){
-          if(r.direction==='BUY'  && stoch.oversold  && stoch.crossUp)   score += 10;
-          if(r.direction==='SELL' && stoch.overbought && stoch.crossDown) score += 10;
-        }
-
-        // Bonus: Digit frequency strong bias for synthetics
-        var df = r.indicators && r.indicators.df;
-        if(df){
-          if(df.strongEvenBias || df.strongOddBias) score += 8;
-          if(df.recentEvenBias || df.recentOddBias) score += 5;
-        }
-
-        // Penalty: MTF not aligned
-        if(!r.mtfAligned) score -= 8;
-
-        // Penalty: weak projected profit
-        if(r.projectedProfit === 'LOW') score -= 10;
-
-        // Historical win rate bonus for this symbol
-        var symHistory = MARKET_SCORES[r.sym];
-        if(symHistory && symHistory.total >= 3){
-          var wr = symHistory.wins / symHistory.total;
-          if(wr >= 0.7) score += 12;
-          else if(wr >= 0.6) score += 6;
-          else if(wr < 0.4) score -= 15; // avoid consistently losing markets
-        }
-
-        r._score = Math.round(score);
-      });
-
-      // ── Sort by composite score (highest first) ──────────
-      candidates.sort(function(a,b){ return b._score - a._score; });
-
-      // Log top 3 candidates
-      console.log('[AutoTrade] Top signals:');
-      candidates.slice(0,3).forEach(function(r){
-        console.log('  ',r.sym, r.direction, r.confidence+'%',
-          'score:'+r._score, 'proj:'+r.projectedProfit,
-          'rsi:'+(r.indicators&&r.indicators.rsi||'n/a'));
-      });
-
-      // ── Pick the best signal ─────────────────────────────
-      var best = candidates[0];
-
-      // Only trade if the composite score clears a high bar
-      var minScore = thresh + 10;
-      if(best._score < minScore){
-        console.log('[AutoTrade] Best score',best._score,'< min',minScore,'— waiting for stronger signal');
-        return;
+      var best=valid[0],sym=best.sym;
+      var ct=best.direction==='BUY'?'CALL':'PUT';
+      var is1s=sym.startsWith('1HZ')||sym.startsWith('R_')||sym==='stpRNG';
+      if(is1s&&best.indicators&&best.indicators.df){
+        var df=best.indicators.df;
+        if(df.strongEvenBias||(df.evenBias&&df.recentEvenBias))ct='DIGITEVEN';
+        else if(df.strongOddBias||(df.oddBias&&df.recentOddBias))ct='DIGITODD';
+        else if(df.overBias)ct='DIGITOVER';
+        else if(df.underBias)ct='DIGITUNDER';
       }
-
-      var sym = best.sym;
-
-      // ── Determine exact contract type ────────────────────
-      var ct = best.direction === 'BUY' ? 'CALL' : 'PUT';
-
-      // Synthetics (1s): use digit contracts when digit bias is strong
-      var is1s = sym.startsWith('1HZ') || sym.startsWith('R_') || sym==='stpRNG';
-      if(is1s && best.indicators && best.indicators.df){
-        var df = best.indicators.df;
-        // Only use digits when there is a STRONG statistical bias
-        if(df.strongEvenBias && df.recentEvenBias)        ct = 'DIGITEVEN';
-        else if(df.strongOddBias && df.recentOddBias)     ct = 'DIGITODD';
-        else if(df.overBias  && df.overPct  > 60)         { ct = 'DIGITOVER';  }
-        else if(df.underBias && df.underPct > 60)         { ct = 'DIGITUNDER'; }
-        // Fall back to CALL/PUT if digit bias is weak
-      }
-
-      // Duration — ticks for synthetics, minutes for forex/indices
-      var isFx = sym.startsWith('frx')||sym.startsWith('cry')||sym.startsWith('OTC');
-      var durU = isFx ? 'm' : 't';
-      var dur  = 5;
-      var barrier = ct==='DIGITOVER'?4:ct==='DIGITUNDER'?5:null;
-
-      console.log('[AutoTrade] EXECUTING:',sym,ct,
-        '| conf:'+best.confidence+'% score:'+best._score,
-        '| proj:'+best.projectedProfit,
-        '| stake:$'+stake);
-
-      _toast(
-        (SYMS[sym]||sym)+' \u2192 '+ct,
-        'Conf: '+best.confidence+'% | Score: '+best._score+' | $'+stake,
-        'i', 2500
-      );
-
-      if(!S.connected || S.activeTrades >= MAX_TRADES) return;
-
-      var params = {
-        symbol:sym, contractType:ct, stake:stake,
-        duration:dur, durationUnit:durU,
-        barrier:barrier, growthRate:null,
-        _conf:best.confidence, _autoMode:true,
-      };
-
+      var isFx=sym.startsWith('frx')||sym.startsWith('cry')||sym.startsWith('OTC');
+      var durU=isFx?'m':'t',dur=5;
+      var barrier=ct==='DIGITOVER'?4:ct==='DIGITUNDER'?5:null;
+      console.log('[AutoTrade] EXECUTING',sym,ct,'conf:',best.confidence+'%','proj:',best.projectedProfit);
+      _toast(N(sym)+' > '+ct,'Conf: '+best.confidence+'% | '+best.projectedProfit+' | $'+stake,'i',3000);
+      if(!S.connected||S.activeTrades>=MAX_TRADES)return;
+      var params={symbol:sym,contractType:ct,stake:stake,duration:dur,durationUnit:durU,barrier:barrier,growthRate:null,_conf:best.confidence,_autoMode:true};
       return executeTrade(params,'AUTO').then(function(r){
-        // ── Update per-symbol win history ─────────────────
-        if(!MARKET_SCORES[sym]) MARKET_SCORES[sym]={wins:0,losses:0,total:0};
-        MARKET_SCORES[sym].total++;
-        if(r.won){
-          MARKET_SCORES[sym].wins++;
-          _toast(
-            'WIN +$'+r.pnl.toFixed(2),
-            (SYMS[sym]||sym)+' \u2014 '+ct+
-            ' | P&L today: '+(S.todayPnl>=0?'+':'')+S.todayPnl.toFixed(2),
-            's', 5000
-          );
-        } else {
-          MARKET_SCORES[sym].losses++;
-          _toast(
-            'Loss -$'+stake,
-            (SYMS[sym]||sym)+' \u2014 '+ct+
-            ' | P&L today: '+(S.todayPnl>=0?'+':'')+S.todayPnl.toFixed(2),
-            'e', 4000
-          );
-        }
-        _updateMetrics(); _updateBal();
-      }).catch(function(e){
-        console.error('[AutoTrade] Execution error:',e.message);
-        if(e.message && e.message.indexOf('real account')>=0){
-          _toast('Trade Error',e.message,'e',8000);
-        }
-      });
+        if(r.won){_toast('AUTO WIN +$'+r.pnl.toFixed(2),N(sym)+' - '+ct+' | Bal: '+S.currency+' '+S.balance.toFixed(2),'s',5000);}
+        else{_toast('AUTO LOSS -$'+stake,N(sym)+' - '+ct+' | Bal: '+S.currency+' '+S.balance.toFixed(2),'e',5000);}
+        _updateMetrics();_updateBal();
+      }).catch(function(e){console.error('[AutoTrade error]',e.message);});
     });
   }
+
   function _getRule(){
     var now=new Date(),h=now.getHours(),m=now.getMinutes();
     var ts=(h<10?'0':'')+h+':'+(m<10?'0':'')+m;
@@ -2137,18 +1914,11 @@ var Bots = (function(){
 // ── Auth ──────────────────────────────────────────────────
 var Auth = (function(){
   var _type='demo';
-function show(){
-    _type='demo';
-    _setModalType('demo');
+  function show(){
+    _type='demo';_setModalType('demo');
     $('tokenIn').value='';
     $('authModal').style.display='flex';
-    setTimeout(function(){
-      var ti=$('tokenIn');if(ti)ti.focus();
-    },100);
-  }
-  // Expose _checkOAuthCallback so boot can call it
-  function _checkOAuthCallbackPublic(){
-    return typeof _checkOAuthCallback==='function'?_checkOAuthCallback():false;
+    setTimeout(function(){$('tokenIn').focus();},100);
   }
   function close(){$('authModal').style.display='none';}
   function _setModalType(t){
@@ -2164,79 +1934,49 @@ function show(){
   }
   function switchType(t){_setModalType(t);$('tokenIn').value='';$('tokenIn').focus();}
   function connect(){
-    var raw=$('tokenIn').value||'';
-    // Clean: remove invisible chars, whitespace, surrounding quotes
-    var t=raw.replace(/[\u200B-\u200D\uFEFF]/g,'')
-             .replace(/[\s]/g,'')
-             .replace(/^['"]+|['"]+$/g,'')
-             .trim();
+    var raw = '';
+    try{ raw = ($('tokenIn') && $('tokenIn').value) || ''; }catch(e){}
+    // Strip all invisible/whitespace/quote chars
+    var t = raw
+      .replace(/[​-‍﻿ ­]/g,'')
+      .replace(/[
+	\s]/g,'')
+      .replace(/^['"\s]+|['"\s]+$/g,'')
+      .trim();
     if(!t){
-      _toast('No Token','Please paste your Deriv API token in the box','e',5000);
-      $('tokenIn').focus();
+      _toast('Token Required',
+        'Paste your Deriv API token above.\nGet it from: app.deriv.com > Account Settings > API Token',
+        'e', 6000);
+      try{$('tokenIn').focus();}catch(e){}
       return;
     }
-    if(t.length<8){
-      _toast('Invalid Token','This token is too short. Copy it directly from app.deriv.com > API Token','e',6000);
+    if(t.length < 5){
+      _toast('Token Too Short','Copy the full token from Deriv','e',5000);
       return;
     }
-    console.log('[Auth] Connecting | type:',_type,'| token length:',t.length,'| first 6:',t.substring(0,6));
-    // Show connecting feedback before closing modal
-    var btn=$('authConnectBtn');
-    if(btn){btn.textContent='Connecting...';btn.disabled=true;}
-    _toast('Connecting...','Opening secure connection to Deriv...','i',3000);
-    close();
-    $('tokenIn').value='';
-    setTimeout(function(){
-      if(btn){btn.textContent='Connect '+(t==='demo'?'Demo':'Real')+' Account';btn.disabled=false;}
-      API.connect(t,_type);
-    },150);
+    console.log('[Auth] Connecting | type:', _type, '| tokenLen:', t.length, '| first8:', t.substring(0,8));
+    // Show connecting feedback
+    try{
+      var btn = $('authConnectBtn');
+      if(btn){ btn.textContent = 'Connecting...'; btn.disabled = true;
+        setTimeout(function(){ btn.textContent='Connect '+(_type==='demo'?'Demo':'Real')+' Account'; btn.disabled=false; }, 8000);
+      }
+    }catch(e){}
+    Auth.close();
+    try{ $('tokenIn').value = ''; }catch(e){}
+    setTimeout(function(){ API.connect(t, _type); }, 200);
   }
   function oauth(){
-    // Check if we already have OAuth tokens in the URL (redirect callback)
-    _checkOAuthCallback();
-    // Open Deriv OAuth page
-    _toast('Opening Deriv OAuth...','You will be redirected back automatically after login','i',4000);
-    // Use redirect flow — opens in same tab so redirect works properly
-    window.location.href = OAUTH_URL;
+    // Deriv OAuth redirect flow — same tab redirect
+    var appId = typeof DERIV_APP_ID !== 'undefined' ? DERIV_APP_ID : 16929;
+    var redirectUri = encodeURIComponent(window.location.origin + window.location.pathname);
+    var url = 'https://oauth.deriv.com/oauth2/authorize?app_id=' + appId +
+      '&l=EN&brand=deriv&redirect_uri=' + redirectUri;
+    _toast('Redirecting to Deriv...','You will be redirected back automatically after login','i',3000);
+    console.log('[OAuth] Redirecting to:', url);
+    setTimeout(function(){ window.location.href = url; }, 800);
   }
-
-  function _checkOAuthCallback(){
-    // Deriv redirects back with ?acct1=...&token1=...&cur1=...
-    var params = new URLSearchParams(window.location.search);
-    var token = params.get('token1') || params.get('token');
-    var acct  = params.get('acct1')  || params.get('acct');
-    var cur   = params.get('cur1')   || params.get('cur');
-    if(token && token.length > 8){
-      console.log('[OAuth] Callback detected | acct:', acct, '| currency:', cur);
-      // Clean URL
-      window.history.replaceState({}, document.title, window.location.pathname);
-      // Store token and type
-      $('tokenIn').value = token;
-      // Determine account type from account prefix
-      // Deriv virtual accounts start with VRTC, real accounts start with CR/MF/MLT etc.
-      var isDemo = acct && (acct.startsWith('VRTC') || acct.startsWith('VRT'));
-      _type = isDemo ? 'demo' : 'real';
-      console.log('[OAuth] Account:', acct, '| type:', _type);
-      _setModalType(_type);
-      // Auto-connect
-      setTimeout(function(){
-        _toast('OAuth Success!','Connecting ' + _type.toUpperCase() + ' account: ' + (acct||''), 's', 4000);
-        connect();
-      }, 500);
-      return true;
-    }
-    return false;
-  }
- return{
-    show:show,
-    close:close,
-    switchType:switchType,
-    connect:connect,
-    oauth:oauth,
-    _checkOAuthCallback: function(){
-      return _checkOAuthCallback ? _checkOAuthCallback() : false;
-    }
-  };
+  return{show:show,close:close,switchType:switchType,connect:connect,oauth:oauth};
 })();
 
 // ── Dashboard ─────────────────────────────────────────────
@@ -2585,55 +2325,80 @@ function go(page){
 
 // ── Wire all buttons ──────────────────────────────────────
 function _wire(){
+  console.log('[NEXUS] Wiring buttons...');
+  function on(id,ev,fn){
+    try{var el=document.getElementById(id);if(el)el[ev]=fn;}
+    catch(e){console.warn('[Wire]',id,ev,e.message);}
+  }
   // Navigation
-  document.querySelectorAll('.nav-item[data-page]').forEach(function(el){
-    el.onclick=function(){go(el.dataset.page);};
-  });
+  try{
+    document.querySelectorAll('.nav-item[data-page]').forEach(function(el){
+      el.onclick=function(){go(this.dataset.page);};
+    });
+  }catch(e){console.warn('[Wire] nav',e.message);}
   // Header
-  $('connBtn').onclick=function(){Auth.show();};
-  $('accBadge').onclick=function(){Auth.show();};
+  on('connBtn','onclick',function(){Auth.show();});
+  on('accBadge','onclick',function(){Auth.show();});
   // Auth modal
-  $('authClose').onclick=function(){Auth.close();};
-  $('demoTab').onclick=function(){Auth.switchType('demo');};
-  $('realTab').onclick=function(){Auth.switchType('real');};
-  $('authConnectBtn').onclick=function(){Auth.connect();};
-  $('authOAuthBtn').onclick=function(){Auth.oauth();};
-  $('tokenIn').onkeydown=function(e){if(e.key==='Enter')Auth.connect();};
+  on('authClose','onclick',function(){Auth.close();});
+  on('demoTab','onclick',function(){Auth.switchType('demo');});
+  on('realTab','onclick',function(){Auth.switchType('real');});
+  on('authConnectBtn','onclick',function(){Auth.connect();});
+  on('authOAuthBtn','onclick',function(){Auth.oauth();});
+  on('tokenIn','onkeydown',function(e){if(e.key==='Enter')Auth.connect();});
   // Auto-trade toggles
-  ['masterAt','banAt','cmdAt'].forEach(function(id){var el=$(id);if(el)el.onclick=function(){Trader.toggleAuto();};});
-  // Dashboard
-  $('chartSym').onchange=function(){Dashboard.changeChartSym(this.value);};
-  $('clearFeedBtn').onclick=function(){var f=$('tfeed');if(f)f.innerHTML='';};
-  // Trade page
-  $('ttGrid').onclick=function(e){var btn=e.target.closest('[data-type]');if(btn)Trade.setType(btn.dataset.type);};
-  $('dgGrid').onclick=function(e){var btn=e.target.closest('[data-digit]');if(btn)Trade.setDigit(btn.dataset.digit);};
-  $('tSym').onchange=function(){Trade.onSymChange();};
-  $('aaToggle').onclick=function(){this.classList.toggle('on');};
-  $('buyBtn').onclick=function(){Trade.exec('buy');};
-  $('sellBtn').onclick=function(){Trade.exec('sell');};
-  $('neutralBtn').onclick=function(){Trade.exec('neutral');};
-  $('analyseBtn').onclick=function(){Trade.analyse();};
-  $('stakePresets').onclick=function(e){var btn=e.target.closest('[data-val]');if(btn){var ts=$('tStake');if(ts)ts.value=btn.dataset.val;}};
-  // Bots
-  $('closeBotLog').onclick=function(){$('botLogBox').style.display='none';};
-  // Signals
-  $('refreshSigBtn').onclick=function(){Signals.render();};
-  $('sigMkt').onchange=function(){Signals.render();};
-  $('sigDir').onchange=function(){Signals.render();};
-  // History
-  $('hSrch').oninput=function(){History.render();};
-  $('hType').onchange=function(){History.render();};
-  $('hRes').onchange=function(){History.render();};
-  $('loadHistBtn').onclick=function(){History.loadFromDeriv();};
-  // Commands
-  $('addRuleBtn').onclick=function(){Cmd.addRule();};
-  // Settings
-  $('reconnectBtn').onclick=function(){Auth.show();};
-  $('disconnectBtn').onclick=function(){API.disconnect();_setStatus('disconnected');};
-  ['notifTrade','notifWin','notifLoss','notifSig','notifTPSL'].forEach(function(id){
-    var el=$(id);if(el)el.onclick=function(){this.classList.toggle('on');};
+  ['masterAt','banAt','cmdAt'].forEach(function(id){
+    on(id,'onclick',function(){Trader.toggleAuto();});
   });
-  console.log('[NEXUS] All buttons wired');
+  // Dashboard
+  on('chartSym','onchange',function(){Dashboard.changeChartSym(this.value);});
+  on('clearFeedBtn','onclick',function(){
+    var f=document.getElementById('tfeed');
+    if(f)f.innerHTML='<div class="empty"><div class="empi">📡</div>No trades yet</div>';
+  });
+  // Trade page
+  on('ttGrid','onclick',function(e){
+    var b=e.target.closest('[data-type]');if(b)Trade.setType(b.dataset.type);
+  });
+  on('dgGrid','onclick',function(e){
+    var b=e.target.closest('[data-digit]');if(b)Trade.setDigit(b.dataset.digit);
+  });
+  on('tSym','onchange',function(){Trade.onSymChange();});
+  on('aaToggle','onclick',function(){this.classList.toggle('on');});
+  on('buyBtn','onclick',function(){Trade.exec('buy');});
+  on('sellBtn','onclick',function(){Trade.exec('sell');});
+  on('neutralBtn','onclick',function(){Trade.exec('neutral');});
+  on('analyseBtn','onclick',function(){Trade.analyse();});
+  on('stakePresets','onclick',function(e){
+    var b=e.target.closest('[data-val]');
+    if(b){var s=document.getElementById('tStake');if(s)s.value=b.dataset.val;}
+  });
+  // Bots
+  on('closeBotLog','onclick',function(){
+    var b=document.getElementById('botLogBox');if(b)b.style.display='none';
+  });
+  // Signals
+  on('refreshSigBtn','onclick',function(){Signals.render();});
+  on('sigMkt','onchange',function(){Signals.render();});
+  on('sigDir','onchange',function(){Signals.render();});
+  // History
+  on('hSrch','oninput',function(){History.render();});
+  on('hType','onchange',function(){History.render();});
+  on('hRes','onchange',function(){History.render();});
+  on('loadHistBtn','onclick',function(){History.loadFromDeriv();});
+  // Commands
+  on('addRuleBtn','onclick',function(){Cmd.addRule();});
+  // Settings
+  on('reconnectBtn','onclick',function(){Auth.show();});
+  on('disconnectBtn','onclick',function(){
+    API.disconnect();_setStatus('disconnected');
+    _toast('Disconnected','Account disconnected','i');
+  });
+  // Notification toggles
+  ['notifTrade','notifWin','notifLoss','notifSig','notifTPSL'].forEach(function(id){
+    on(id,'onclick',function(){this.classList.toggle('on');});
+  });
+  console.log('[NEXUS] All buttons wired OK');
 }
 
 // ── Boot ──────────────────────────────────────────────────
@@ -2668,17 +2433,32 @@ window.addEventListener('DOMContentLoaded',function(){
       }catch(e2){console.error('[Boot] Emergency wire failed:',e2.message);}
     },100);
   }
-  // Step 5: Check for OAuth callback first, show modal if no callback
-  setTimeout(function(){
-    try{
-      var hasCallback = Auth._checkOAuthCallback ? Auth._checkOAuthCallback() : false;
-      if(!hasCallback){
-        Auth.show();
-      }
-    }catch(e){
-      console.error('[Boot] Auth.show failed:',e.message);
-      try{Auth.show();}catch(e2){}
+  
+  // Check for OAuth callback in URL
+  try{
+    var urlParams = new URLSearchParams(window.location.search);
+    var oauthToken = urlParams.get('token1') || urlParams.get('token');
+    var oauthAcct  = urlParams.get('acct1')  || urlParams.get('acct');
+    var oauthCur   = urlParams.get('cur1')   || urlParams.get('cur');
+    if(oauthToken && oauthToken.length > 5){
+      console.log('[OAuth] Callback detected | acct:', oauthAcct, '| cur:', oauthCur);
+      // Clean URL without reload
+      window.history.replaceState({}, document.title, window.location.pathname);
+      // Determine account type from prefix (VRTC = virtual/demo, CR/MF/MLT = real)
+      var isOAuthDemo = oauthAcct && (oauthAcct.startsWith('VRTC') || oauthAcct.startsWith('VRT'));
+      var oauthType = isOAuthDemo ? 'demo' : 'real';
+      _toast('OAuth Login Detected','Connecting ' + oauthType.toUpperCase() + ' account: ' + (oauthAcct||'...'), 's', 5000);
+      // Connect after short delay
+      setTimeout(function(){
+        try{ Auth.close(); }catch(e){}
+        API.connect(oauthToken, oauthType);
+      }, 1000);
     }
+  }catch(e){ console.warn('[OAuth callback]', e.message); }
+
+  // Step 5: Show auth modal
+  setTimeout(function(){
+    try{Auth.show();}catch(e){console.error('[Boot] Auth.show failed:',e.message);}
   },500);
   // Step 6: Keep toggles in sync
   setInterval(function(){
