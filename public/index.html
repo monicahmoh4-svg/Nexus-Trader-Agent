@@ -689,8 +689,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 <div id="toasts"></div>
 
 <script>
-'use strict';
-const $ = id => document.getElementById(id);
+function $(id){ return document.getElementById(id); }
 
 window.onerror = function(msg,src,line){
   console.error('[ERR]',msg,'line',line);
@@ -706,15 +705,15 @@ window.onerror = function(msg,src,line){
 // Deriv App ID 16929 - valid public app that accepts API tokens
 // created at app.deriv.com/account/api-token
 // To use your own app: register at developers.deriv.com
-const DERIV_APP_ID = 16929;
-const WS_ENDPOINTS = [
+var DERIV_APP_ID = 16929;
+var WS_ENDPOINTS = [
   'wss://ws.derivws.com/websockets/v3?app_id=' + DERIV_APP_ID,
   'wss://ws.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID,
   'wss://frontend.binaryws.com/websockets/v3?app_id=' + DERIV_APP_ID,
 ];
-const MAX_TRADES = 5;
-const TICK_SYMS = ['1HZ50V','1HZ75V','1HZ100V','BOOM500','CRASH500','frxEURUSD','frxGBPUSD','frxXAUUSD','cryBTCUSD','JD100'];
-const SYMS = {
+var MAX_TRADES = 5;
+var TICK_SYMS = ['1HZ50V','1HZ75V','1HZ100V','BOOM500','CRASH500','frxEURUSD','frxGBPUSD','frxXAUUSD','cryBTCUSD','JD100'];
+var SYMS = {
   '1HZ10V':'VOL 10 (1s)','1HZ25V':'VOL 25 (1s)','1HZ50V':'VOL 50 (1s)','1HZ75V':'VOL 75 (1s)','1HZ100V':'VOL 100 (1s)',
   'R_10':'Volatility 10','R_25':'Volatility 25','R_50':'Volatility 50','R_75':'Volatility 75','R_100':'Volatility 100',
   'BOOM300N':'Boom 300','BOOM500':'Boom 500','BOOM1000':'Boom 1000',
@@ -727,18 +726,18 @@ const SYMS = {
   'frxXAUUSD':'Gold/USD','frxXAGUSD':'Silver/USD','frxXPDUSD':'Palladium/USD','frxXPTUSD':'Platinum/USD',
   'OTC_DJI':'Wall St 30','OTC_SP500':'US 500','OTC_NDX':'US Tech 100','OTC_FTSE':'UK 100','OTC_GDAXI':'Germany 40','OTC_N225':'Japan 225',
 };
-const N = s => SYMS[s]||s;
-const SYM_MKT = s => {
+function N(s){ return SYMS[s]||s; }
+function SYM_MKT(s){
   if(s.startsWith('1HZ')||s.startsWith('R_')||s.startsWith('BOOM')||s.startsWith('CRASH')||s.startsWith('JD')||s==='stpRNG'||s.startsWith('RD'))return'synthetics';
   if(s.startsWith('frxX'))return'commodities';
   if(s.startsWith('frx'))return'forex';
   if(s.startsWith('cry'))return'crypto';
   if(s.startsWith('OTC'))return'indices';
   return'synthetics';
-};
+}
 
 //  State 
-const S = {
+var S = {
   connected:false,accountType:'demo',balance:0,currency:'USD',
   loginid:'',todayPnl:0,wins:0,losses:0,activeTrades:0,
   autoTrade:false,autoTimer:null,streak:0,streakType:null,
@@ -2325,151 +2324,151 @@ function go(page){
 
 //  Wire all buttons 
 function _wire(){
-  console.log('[NEXUS] Wiring buttons...');
   function on(id,ev,fn){
-    try{var el=document.getElementById(id);if(el)el[ev]=fn;}
-    catch(e){console.warn('[Wire]',id,ev,e.message);}
+    var el=document.getElementById(id);
+    if(el){ el[ev]=fn; }
   }
   // Navigation
-  try{
-    document.querySelectorAll('.nav-item[data-page]').forEach(function(el){
-      el.onclick=function(){go(this.dataset.page);};
-    });
-  }catch(e){console.warn('[Wire] nav',e.message);}
+  var navItems=document.querySelectorAll('.nav-item[data-page]');
+  for(var ni=0;ni<navItems.length;ni++){
+    (function(el){
+      el.onclick=function(){ go(el.dataset.page); };
+    })(navItems[ni]);
+  }
   // Header
-  on('connBtn','onclick',function(){Auth.show();});
-  on('accBadge','onclick',function(){Auth.show();});
+  on('connBtn','onclick',function(){ Auth.show(); });
+  on('accBadge','onclick',function(){ Auth.show(); });
   // Auth modal
-  on('authClose','onclick',function(){Auth.close();});
-  on('demoTab','onclick',function(){Auth.switchType('demo');});
-  on('realTab','onclick',function(){Auth.switchType('real');});
-  on('authConnectBtn','onclick',function(){Auth.connect();});
-  on('authOAuthBtn','onclick',function(){Auth.oauth();});
-  on('tokenIn','onkeydown',function(e){if(e.key==='Enter')Auth.connect();});
+  on('authClose','onclick',function(){ Auth.close(); });
+  on('demoTab','onclick',function(){ Auth.switchType('demo'); });
+  on('realTab','onclick',function(){ Auth.switchType('real'); });
+  on('authConnectBtn','onclick',function(){ Auth.connect(); });
+  on('authOAuthBtn','onclick',function(){ Auth.oauth(); });
+  on('tokenIn','onkeydown',function(e){ if(e.key==='Enter'){ Auth.connect(); } });
   // Auto-trade toggles
-  ['masterAt','banAt','cmdAt'].forEach(function(id){
-    on(id,'onclick',function(){Trader.toggleAuto();});
-  });
+  on('masterAt','onclick',function(){ Trader.toggleAuto(); });
+  on('banAt','onclick',function(){ Trader.toggleAuto(); });
+  on('cmdAt','onclick',function(){ Trader.toggleAuto(); });
   // Dashboard
-  on('chartSym','onchange',function(){Dashboard.changeChartSym(this.value);});
+  on('chartSym','onchange',function(){ Dashboard.changeChartSym(this.value); });
   on('clearFeedBtn','onclick',function(){
     var f=document.getElementById('tfeed');
-    if(f)f.innerHTML='<div class="empty"><div class="empi"></div>No trades yet</div>';
+    if(f){ f.innerHTML=''; }
   });
   // Trade page
   on('ttGrid','onclick',function(e){
-    var b=e.target.closest('[data-type]');if(b)Trade.setType(b.dataset.type);
+    var b=e.target.closest('[data-type]');
+    if(b){ Trade.setType(b.dataset.type); }
   });
   on('dgGrid','onclick',function(e){
-    var b=e.target.closest('[data-digit]');if(b)Trade.setDigit(b.dataset.digit);
+    var b=e.target.closest('[data-digit]');
+    if(b){ Trade.setDigit(b.dataset.digit); }
   });
-  on('tSym','onchange',function(){Trade.onSymChange();});
-  on('aaToggle','onclick',function(){this.classList.toggle('on');});
-  on('buyBtn','onclick',function(){Trade.exec('buy');});
-  on('sellBtn','onclick',function(){Trade.exec('sell');});
-  on('neutralBtn','onclick',function(){Trade.exec('neutral');});
-  on('analyseBtn','onclick',function(){Trade.analyse();});
+  on('tSym','onchange',function(){ Trade.onSymChange(); });
+  on('aaToggle','onclick',function(){ this.classList.toggle('on'); });
+  on('buyBtn','onclick',function(){ Trade.exec('buy'); });
+  on('sellBtn','onclick',function(){ Trade.exec('sell'); });
+  on('neutralBtn','onclick',function(){ Trade.exec('neutral'); });
+  on('analyseBtn','onclick',function(){ Trade.analyse(); });
   on('stakePresets','onclick',function(e){
     var b=e.target.closest('[data-val]');
-    if(b){var s=document.getElementById('tStake');if(s)s.value=b.dataset.val;}
+    if(b){ var s=document.getElementById('tStake'); if(s){ s.value=b.dataset.val; } }
   });
   // Bots
   on('closeBotLog','onclick',function(){
-    var b=document.getElementById('botLogBox');if(b)b.style.display='none';
+    var b=document.getElementById('botLogBox');
+    if(b){ b.style.display='none'; }
   });
   // Signals
-  on('refreshSigBtn','onclick',function(){Signals.render();});
-  on('sigMkt','onchange',function(){Signals.render();});
-  on('sigDir','onchange',function(){Signals.render();});
+  on('refreshSigBtn','onclick',function(){ Signals.render(); });
+  on('sigMkt','onchange',function(){ Signals.render(); });
+  on('sigDir','onchange',function(){ Signals.render(); });
   // History
-  on('hSrch','oninput',function(){History.render();});
-  on('hType','onchange',function(){History.render();});
-  on('hRes','onchange',function(){History.render();});
-  on('loadHistBtn','onclick',function(){History.loadFromDeriv();});
+  on('hSrch','oninput',function(){ History.render(); });
+  on('hType','onchange',function(){ History.render(); });
+  on('hRes','onchange',function(){ History.render(); });
+  on('loadHistBtn','onclick',function(){ History.loadFromDeriv(); });
   // Commands
-  on('addRuleBtn','onclick',function(){Cmd.addRule();});
+  on('addRuleBtn','onclick',function(){ Cmd.addRule(); });
   // Settings
-  on('reconnectBtn','onclick',function(){Auth.show();});
+  on('reconnectBtn','onclick',function(){ Auth.show(); });
   on('disconnectBtn','onclick',function(){
-    API.disconnect();_setStatus('disconnected');
-    _toast('Disconnected','Account disconnected','i');
+    API.disconnect();
+    _setStatus('disconnected');
   });
   // Notification toggles
-  ['notifTrade','notifWin','notifLoss','notifSig','notifTPSL'].forEach(function(id){
-    on(id,'onclick',function(){this.classList.toggle('on');});
-  });
-  console.log('[NEXUS] All buttons wired OK');
+  var notifIds=['notifTrade','notifWin','notifLoss','notifSig','notifTPSL'];
+  for(var ni2=0;ni2<notifIds.length;ni2++){
+    on(notifIds[ni2],'onclick',function(){ this.classList.toggle('on'); });
+  }
+  console.log('[NEXUS] _wire() complete - all buttons active');
 }
 
 //  Boot 
 window.addEventListener('DOMContentLoaded',function(){
-  console.log('[NEXUS TRADE] v3.0 booting...');
-  // Step 1: Init bots
-  try{Bots.init();}catch(e){console.error('[Boot] Bots.init failed:',e.message);}
-  // Step 2: Start simulated ticker prices
-  try{Ticker.startSim();}catch(e){console.error('[Boot] Ticker failed:',e.message);}
-  // Step 3: Render markets page
-  try{Markets.render();}catch(e){console.error('[Boot] Markets failed:',e.message);}
-  // Step 4: Wire ALL buttons - critical step
+  console.log('[NEXUS TRADE] Booting...');
+
+  // Step 1: Init modules
+  try{ Bots.init(); }catch(e){ console.error('[Boot] Bots:',e.message); }
+  try{ Ticker.startSim(); }catch(e){ console.error('[Boot] Ticker:',e.message); }
+  try{ Markets.render(); }catch(e){ console.error('[Boot] Markets:',e.message); }
+
+  // Step 2: Wire ALL buttons
   try{
     _wire();
-    console.log('[Boot] Buttons wired OK');
   }catch(e){
-    console.error('[Boot] _wire() failed:',e.message,e.stack);
-    // Emergency fallback: try to wire connect button manually
-    setTimeout(function(){
-      try{
-        var cb=document.getElementById('connBtn');
-        if(cb)cb.onclick=function(){Auth.show();};
-        var acb=document.getElementById('authConnectBtn');
-        if(acb)acb.onclick=function(){Auth.connect();};
-        var dt=document.getElementById('demoTab');
-        if(dt)dt.onclick=function(){Auth.switchType('demo');};
-        var rt=document.getElementById('realTab');
-        if(rt)rt.onclick=function(){Auth.switchType('real');};
-        var ac=document.getElementById('authClose');
-        if(ac)ac.onclick=function(){Auth.close();};
-        console.log('[Boot] Emergency button wiring done');
-      }catch(e2){console.error('[Boot] Emergency wire failed:',e2.message);}
-    },100);
+    console.error('[Boot] _wire failed:',e.message);
+    // Emergency wire: connect button only
+    try{
+      var cb=document.getElementById('connBtn');
+      if(cb){ cb.onclick=function(){ Auth.show(); }; }
+      var acb=document.getElementById('authConnectBtn');
+      if(acb){ acb.onclick=function(){ Auth.connect(); }; }
+      var dt=document.getElementById('demoTab');
+      if(dt){ dt.onclick=function(){ Auth.switchType('demo'); }; }
+      var rt=document.getElementById('realTab');
+      if(rt){ rt.onclick=function(){ Auth.switchType('real'); }; }
+      var ac=document.getElementById('authClose');
+      if(ac){ ac.onclick=function(){ Auth.close(); }; }
+    }catch(e2){ console.error('[Boot] Emergency wire failed:',e2.message); }
   }
-  
-  // Check for OAuth callback in URL
-  try{
-    var urlParams = new URLSearchParams(window.location.search);
-    var oauthToken = urlParams.get('token1') || urlParams.get('token');
-    var oauthAcct  = urlParams.get('acct1')  || urlParams.get('acct');
-    var oauthCur   = urlParams.get('cur1')   || urlParams.get('cur');
-    if(oauthToken && oauthToken.length > 5){
-      console.log('[OAuth] Callback detected | acct:', oauthAcct, '| cur:', oauthCur);
-      // Clean URL without reload
-      window.history.replaceState({}, document.title, window.location.pathname);
-      // Determine account type from prefix (VRTC = virtual/demo, CR/MF/MLT = real)
-      var isOAuthDemo = oauthAcct && (oauthAcct.startsWith('VRTC') || oauthAcct.startsWith('VRT'));
-      var oauthType = isOAuthDemo ? 'demo' : 'real';
-      _toast('OAuth Login Detected','Connecting ' + oauthType.toUpperCase() + ' account: ' + (oauthAcct||'...'), 's', 5000);
-      // Connect after short delay
-      setTimeout(function(){
-        try{ Auth.close(); }catch(e){}
-        API.connect(oauthToken, oauthType);
-      }, 1000);
-    }
-  }catch(e){ console.warn('[OAuth callback]', e.message); }
 
-  // Step 5: Show auth modal
-  setTimeout(function(){
-    try{Auth.show();}catch(e){console.error('[Boot] Auth.show failed:',e.message);}
-  },500);
-  // Step 6: Keep toggles in sync
+  // Step 3: Check OAuth redirect callback
+  try{
+    var urlParams=new URLSearchParams(window.location.search);
+    var oauthToken=urlParams.get('token1')||urlParams.get('token');
+    var oauthAcct=urlParams.get('acct1')||urlParams.get('acct');
+    if(oauthToken && oauthToken.length>5){
+      window.history.replaceState({},'',window.location.pathname);
+      var isDemo=oauthAcct&&(oauthAcct.indexOf('VRTC')===0||oauthAcct.indexOf('VRT')===0);
+      var oauthType=isDemo?'demo':'real';
+      console.log('[OAuth] Callback | acct:',oauthAcct,'| type:',oauthType);
+      _toast('OAuth Connected','Connecting '+oauthType.toUpperCase()+' account...','s',4000);
+      setTimeout(function(){ API.connect(oauthToken,oauthType); },800);
+    } else {
+      // No OAuth callback - show login modal
+      setTimeout(function(){
+        try{ Auth.show(); }catch(e){ console.error('[Boot] Auth.show:',e.message); }
+      },400);
+    }
+  }catch(e){
+    console.error('[Boot] OAuth check:',e.message);
+    setTimeout(function(){ try{ Auth.show(); }catch(e2){} },400);
+  }
+
+  // Step 4: Keep toggle buttons in sync
   setInterval(function(){
     try{
       var on=S.autoTrade;
-      document.querySelectorAll('.btog').forEach(function(el){el.classList.toggle('on',on);});
-      var l=document.getElementById('atLbl');if(l)l.textContent=on?'ON':'OFF';
+      var btoggs=document.querySelectorAll('.btog');
+      for(var i=0;i<btoggs.length;i++){ btoggs[i].classList.toggle('on',on); }
+      var l=document.getElementById('atLbl');
+      if(l){ l.textContent=on?'ON':'OFF'; }
     }catch(e){}
   },800);
-  console.log('[NEXUS TRADE] v3.0 Ready');
-});
+
+  console.log('[NEXUS TRADE] Boot complete');
+}););
 </script>
 </body>
 </html>
