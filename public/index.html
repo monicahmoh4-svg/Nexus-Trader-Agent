@@ -715,9 +715,14 @@ window.onerror = function(msg, src, line, col, err){
 };
 
 /* CONFIG */
-var DERIV_APP_ID = 16929;
+// Deriv app IDs to try - PAT tokens (pat_xxx) work with any of these
+var DERIV_APP_IDS = [1089, 16929, 1, 36544];
+var DERIV_APP_ID = DERIV_APP_IDS[0];
 var WS_ENDPOINTS = [
+  'wss://ws.derivws.com/websockets/v3?app_id=1089',
   'wss://ws.derivws.com/websockets/v3?app_id=16929',
+  'wss://ws.derivws.com/websockets/v3?app_id=36544',
+  'wss://ws.binaryws.com/websockets/v3?app_id=1089',
   'wss://ws.binaryws.com/websockets/v3?app_id=16929'
 ];
 var MAX_TRADES = 5;
@@ -851,11 +856,22 @@ var API = (function(){
 
   function connect(t, type){
     type = type || 'demo';
-    token = (t || '').replace(/\s/g, '').trim();
-    if(!token || token.length < 5){
+    // Clean token - handle both old format and new PAT format (pat_xxxxxxx)
+    token = (t || '')
+      .replace(/[\r\n\t]/g, '')
+      .replace(/\s/g, '')
+      .trim();
+    // Remove any surrounding quotes
+    if((token[0]==='"'||token[0]==="'") && (token[token.length-1]==='"'||token[token.length-1]==="'")){
+      token=token.substring(1,token.length-1);
+    }
+    if(!token || token.length < 4){
       _toast('Token Required', 'Paste your Deriv API token. Get it from: app.deriv.com > Account Settings > API Token', 'e', 8000);
       return;
     }
+    // Log token type for debugging
+    var isPAT = token.indexOf('pat_') === 0;
+    console.log('[API] Token type:', isPAT ? 'PAT (new format)' : 'Standard', '| length:', token.length, '| prefix:', token.substring(0,8));
     S.accountType = type;
     S.connected = false;
     S.balance = 0;
@@ -909,8 +925,24 @@ var API = (function(){
           console.error('[API] Auth error | code:', code, '| msg:', msg);
           S._authFailed = true;
           var hint = '';
-          if(code === 'InvalidToken' || msg.toLowerCase().indexOf('invalid') >= 0){
-            hint = 'Token rejected. Steps to fix:\n1. Go to app.deriv.com\n2. Login to the correct account (Demo OR Real)\n3. Account Settings > API Token\n4. Create NEW token with READ + TRADE permissions\n5. Copy FULL token and paste it here';
+          if(code === 'InvalidToken' || code === 'InvalidAppID' || msg.toLowerCase().indexOf('invalid') >= 0 || msg.toLowerCase().indexOf('token') >= 0){
+            // Try next endpoint with different app_id before giving up
+            if(wsIdx < WS_ENDPOINTS.length - 1){
+              console.log('[API] Trying next endpoint due to auth error...');
+              wsIdx++;
+              setTimeout(function(){ _open(); }, 500);
+              return;
+            }
+            hint = 'Token rejected by Deriv server. Error: ' + msg + ' (code: ' + code + ')\n\n' +
+              'For NEW Deriv PAT tokens (pat_xxx...):\n' +
+              '1. Go to app.deriv.com\n' +
+              '2. Login to Demo OR Real account\n' +
+              '3. Click your profile icon > API Token\n' +
+              '4. Click CREATE TOKEN\n' +
+              '5. Name it anything, select READ + TRADE\n' +
+              '6. Copy the FULL token (starts with pat_)\n' +
+              '7. Paste it here and click Connect\n\n' +
+              'Make sure token has READ and TRADE permissions.';
           } else if(code === 'InvalidAppID'){
             hint = 'App ID error. Please refresh the page and try again.';
           } else if(code === 'RateLimit'){
@@ -1849,7 +1881,11 @@ var Auth = (function(){
   function connect(){
     var ti=$('tokenIn'); if(!ti){ _toast('Error','Token input not found','e'); return; }
     var raw=ti.value||'';
-    var t=raw.replace(/\s/g,'').trim();
+    // Handle PAT tokens and clean whitespace
+    var t=raw.replace(/[\r\n\t]/g,'').replace(/\s/g,'').trim();
+    if((t[0]==='"'||t[0]==="'")&&(t[t.length-1]==='"'||t[t.length-1]==="'")){ t=t.substring(1,t.length-1); }
+    var isPAT = t.indexOf('pat_')===0;
+    console.log('[Auth] Token type:', isPAT?'PAT':'Standard', '| len:', t.length);
     if(!t){ _toast('Token Required','Paste your Deriv API token in the box above','e',5000); ti.focus(); return; }
     if(t.length<5){ _toast('Token Too Short','Copy the full token from app.deriv.com','e',5000); return; }
     console.log('[Auth] Connecting | type:',_type,'| tokenLen:',t.length,'| first8:',t.substring(0,8));
