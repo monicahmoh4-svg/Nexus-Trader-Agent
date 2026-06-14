@@ -856,22 +856,17 @@ var API = (function(){
 
   function connect(t, type){
     type = type || 'demo';
-    // Clean token - handle both old format and new PAT format (pat_xxxxxxx)
-    token = (t || '')
-      .replace(/[\r\n\t]/g, '')
-      .replace(/\s/g, '')
-      .trim();
-    // Remove any surrounding quotes
-    if((token[0]==='"'||token[0]==="'") && (token[token.length-1]==='"'||token[token.length-1]==="'")){
-      token=token.substring(1,token.length-1);
+    // Clean token thoroughly
+    token = (t || '').replace(/[\r\n\t\s]/g, '').trim();
+    if((token.charAt(0)==='"'||token.charAt(0)==="'")&&(token.charAt(token.length-1)==='"'||token.charAt(token.length-1)==="'")){
+      token = token.substring(1, token.length-1);
     }
     if(!token || token.length < 4){
-      _toast('Token Required', 'Paste your Deriv API token. Get it from: app.deriv.com > Account Settings > API Token', 'e', 8000);
+      _toast('Token Required', 'Paste your Deriv API token', 'e', 6000);
       return;
     }
-    // Log token type for debugging
     var isPAT = token.indexOf('pat_') === 0;
-    console.log('[API] Token type:', isPAT ? 'PAT (new format)' : 'Standard', '| length:', token.length, '| prefix:', token.substring(0,8));
+    console.log('[API] Connecting | type:', type, '| PAT:', isPAT, '| len:', token.length, '| prefix:', token.substring(0,10));
     S.accountType = type;
     S.connected = false;
     S.balance = 0;
@@ -879,110 +874,119 @@ var API = (function(){
     S.loginid = '';
     S.wins = 0; S.losses = 0; S.todayPnl = 0; S.activeTrades = 0;
     S._authFailed = false;
-    reconnAttempts = 0; wsIdx = 0;
-    console.log('[API] connect | type:', type, '| tokenLen:', token.length);
+    reconnAttempts = 0;
+    wsIdx = 0;
     _setStatus('connecting');
     _open();
   }
 
   function _open(){
     if(ws){
-      try{ ws.onopen = null; ws.onmessage = null; ws.onerror = null; ws.onclose = null; ws.close(); }catch(e){}
+      try{ ws.onopen=null; ws.onmessage=null; ws.onerror=null; ws.onclose=null; ws.close(); }catch(e){}
     }
     ws = null;
-    _setStatus('connecting');
-    var ep = WS_ENDPOINTS[wsIdx % WS_ENDPOINTS.length];
+    // Use single primary endpoint — fast connection
+    var ep = 'wss://ws.derivws.com/websockets/v3?app_id=1089';
     console.log('[WS] Connecting to:', ep);
+    _setStatus('connecting');
     var connTimeout;
     try{ ws = new WebSocket(ep); }
     catch(e){
-      _toast('Connection Error', 'Cannot open WebSocket. Check internet connection.', 'e');
+      _toast('WebSocket Error', 'Cannot connect. Check your internet.', 'e', 6000);
       _setStatus('disconnected');
       return;
     }
+    // 8 second timeout — fast failure
     connTimeout = setTimeout(function(){
       if(!ws || ws.readyState !== 1){
-        wsIdx++;
-        if(wsIdx < WS_ENDPOINTS.length){
-          _toast('Retrying...', 'Trying alternate Deriv server...', 'i', 2000);
-          _open();
-        } else {
-          _toast('Cannot Connect', 'Deriv servers unreachable. Check internet.', 'e', 8000);
+        console.warn('[WS] Timeout — retrying with backup');
+        if(ws) try{ ws.close(); }catch(e){}
+        ws = null;
+        // Try backup endpoint
+        try{
+          ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089');
+          ws.onopen = _handleOpen;
+          ws.onmessage = _handleMsg;
+          ws.onerror = function(e){ console.error('[WS backup error]', e); };
+          ws.onclose = function(e){
+            console.log('[WS backup closed]', e.code);
+            S.connected = false;
+            _setStatus('disconnected');
+            _toast('Connection Failed', 'Could not connect to Deriv. Check internet and try again.', 'e', 8000);
+          };
+        }catch(e2){
           _setStatus('disconnected');
+          _toast('Connection Failed', 'Cannot reach Deriv servers. Check internet.', 'e', 8000);
         }
       }
-    }, 12000);
+    }, 8000);
 
-    ws.onopen = function(){
+    function _handleOpen(){
       clearTimeout(connTimeout);
-      reconnAttempts = 0; wsIdx = 0;
+      reconnAttempts = 0;
       _startPing();
-      console.log('[WS] Open. Authorizing...');
-      _send({ authorize: token }, function(r){
-        if(r.error){
-          var code = r.error.code || '';
-          var msg = r.error.message || 'Unknown error';
-          console.error('[API] Auth error | code:', code, '| msg:', msg);
+      console.log('[WS] Open — authorizing token...');
+      // Send authorize immediately
+      var authPayload = {authorize: token, req_id: reqId++};
+      ws.send(JSON.stringify(authPayload));
+    }
+
+    function _handleMsg(e){
+      var msg;
+      try{ msg = JSON.parse(e.data); }catch(err){ return; }
+      // Handle authorize response directly here for speed
+      if(msg.msg_type === 'authorize'){
+        if(msg.error){
+          var code = msg.error.code || '';
+          var errMsg = msg.error.message || 'Unknown error';
+          console.error('[API] Auth FAILED | code:', code, '| msg:', errMsg);
           S._authFailed = true;
-          var hint = '';
-          if(code === 'InvalidToken' || code === 'InvalidAppID' || msg.toLowerCase().indexOf('invalid') >= 0 || msg.toLowerCase().indexOf('token') >= 0){
-            // Try next endpoint with different app_id before giving up
-            if(wsIdx < WS_ENDPOINTS.length - 1){
-              console.log('[API] Trying next endpoint due to auth error...');
-              wsIdx++;
-              setTimeout(function(){ _open(); }, 500);
-              return;
-            }
-            hint = 'Token rejected by Deriv server. Error: ' + msg + ' (code: ' + code + ')\n\n' +
-              'For NEW Deriv PAT tokens (pat_xxx...):\n' +
-              '1. Go to app.deriv.com\n' +
-              '2. Login to Demo OR Real account\n' +
-              '3. Click your profile icon > API Token\n' +
-              '4. Click CREATE TOKEN\n' +
-              '5. Name it anything, select READ + TRADE\n' +
-              '6. Copy the FULL token (starts with pat_)\n' +
-              '7. Paste it here and click Connect\n\n' +
-              'Make sure token has READ and TRADE permissions.';
-          } else if(code === 'InvalidAppID'){
-            hint = 'App ID error. Please refresh the page and try again.';
-          } else if(code === 'RateLimit'){
-            hint = 'Too many attempts. Wait 60 seconds and try again.';
-          } else if(code === 'DisabledClient'){
-            hint = 'Account disabled. Contact Deriv support.';
-          } else {
-            hint = msg + ' (code: ' + code + ')';
-          }
+          var hint = 'Connection failed: ' + errMsg + ' (code: ' + code + ')\n\n' +
+            'To fix:\n' +
+            '1. Go to app.deriv.com\n' +
+            '2. Log into your account (Demo or Real)\n' +
+            '3. Click profile icon > API Token\n' +
+            '4. Click CREATE TOKEN\n' +
+            '5. Enable READ + TRADE permissions\n' +
+            '6. Copy the full token (starts with pat_)\n' +
+            '7. Paste it here and click Connect';
           _toast('Auth Failed', hint, 'e', 15000);
           _setStatus('disconnected');
           token = null;
           return;
         }
-        var a = r.authorize;
+        // Auth SUCCESS
+        var a = msg.authorize;
         var isVirtual = (a.is_virtual === 1 || a.is_virtual === '1' || a.is_virtual === true);
         S.accountType = isVirtual ? 'demo' : 'real';
-        S.balance = a.balance != null ? parseFloat(String(a.balance).replace(/,/g, '')) || 0 : 0;
+        S.balance = a.balance != null ? parseFloat(String(a.balance).replace(/,/g,'')) || 0 : 0;
         S.currency = a.currency || 'USD';
         S.loginid = a.loginid || '';
         S.connected = true;
         S.activeTrades = 0;
-        console.log('=== AUTH SUCCESS === LoginID:', S.loginid, '| Type:', S.accountType, '| Balance:', S.balance, S.currency);
+        console.log('[API] AUTH SUCCESS | loginid:', S.loginid, '| type:', S.accountType, '| balance:', S.balance, S.currency);
         _setStatus('connected');
         _updateBal();
         _updateMetrics();
-        _send({ balance: 1, subscribe: 1 }, function(br){
+        // Subscribe to balance updates (authoritative source)
+        _send({balance: 1, subscribe: 1}, function(br){
           if(!br.error && br.balance){
-            S.balance = parseFloat(String(br.balance.balance).replace(/,/g, '')) || S.balance;
+            S.balance = parseFloat(String(br.balance.balance).replace(/,/g,'')) || S.balance;
             S.currency = br.balance.currency || S.currency;
             _updateBal(); _updateMetrics();
           }
         });
-        _send({ transaction: 1, subscribe: 1 });
-        setTimeout(function(){ requestFreshBalance(); }, 1500);
-        _send({ portfolio: 1 }, function(pr){
+        // Subscribe to transaction stream
+        _send({transaction: 1, subscribe: 1});
+        // Confirm balance
+        setTimeout(function(){ requestFreshBalance(); }, 1000);
+        setTimeout(function(){ requestFreshBalance(); }, 3000);
+        // Load open contracts
+        _send({portfolio: 1}, function(pr){
           if(!pr.error){
-            var contracts = pr.portfolio.contracts || [];
-            for(var ci = 0; ci < contracts.length; ci++){
-              _send({ proposal_open_contract: 1, contract_id: contracts[ci].contract_id, subscribe: 1 });
+            var cs = pr.portfolio.contracts || [];
+            for(var ci=0; ci<cs.length; ci++){
+              _send({proposal_open_contract: 1, contract_id: cs[ci].contract_id, subscribe: 1});
               S.activeTrades++;
             }
           }
@@ -993,30 +997,28 @@ var API = (function(){
         var label = S.accountType === 'real' ? 'REAL ACCOUNT' : 'Demo Account';
         _toast('Connected: ' + label, S.loginid + ' | ' + S.currency + ' ' + S.balance.toFixed(2), 's', 8000);
         setTimeout(function(){ AE.warmup(); }, 800);
-        setTimeout(function(){ _updateBal(); _updateMetrics(); }, 3000);
-      });
-    };
+        setTimeout(function(){ _updateBal(); _updateMetrics(); }, 2000);
+        // Now switch to the standard message handler for ongoing messages
+        ws.onmessage = _handleMsg;
+        return;
+      }
+      // Route all other messages
+      try{ _handle(msg); }catch(err){ console.error('[WS handle]', err); }
+    }
 
-    ws.onmessage = function(e){
-      try{ _handle(JSON.parse(e.data)); }catch(err){ console.error('[WS parse]', err); }
-    };
+    ws.onopen = _handleOpen;
+    ws.onmessage = _handleMsg;
     ws.onerror = function(e){ console.error('[WS error]', e); };
     ws.onclose = function(e){
       clearTimeout(connTimeout);
       _stopPing();
-      console.log('[WS] Closed | code:', e.code);
+      console.log('[WS] Closed | code:', e.code, '| clean:', e.wasClean);
       if(S.connected){
         S.connected = false;
         _setStatus('disconnected');
-        _toast('Disconnected', 'Lost connection. Reconnecting...', 'i', 3000);
         _schedReconn();
-      } else if(token && !S._authFailed){
-        wsIdx++;
-        if(wsIdx < WS_ENDPOINTS.length){
-          setTimeout(function(){ _open(); }, 1500);
-        } else {
-          wsIdx = 0; _schedReconn();
-        }
+      } else if(!S._authFailed) {
+        _setStatus('disconnected');
       } else {
         _setStatus('disconnected');
       }
