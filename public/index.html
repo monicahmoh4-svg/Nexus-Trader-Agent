@@ -1840,13 +1840,18 @@ var Bots = (function(){
 /* AUTH */
 var Auth = (function(){
   var _type='demo';
+
   function show(){
     _type='demo'; _setModalType('demo');
     var ti=$('tokenIn'); if(ti) ti.value='';
     var m=$('authModal'); if(m) m.style.display='flex';
     setTimeout(function(){ var ti=$('tokenIn'); if(ti) ti.focus(); },100);
   }
-  function close(){ var m=$('authModal'); if(m) m.style.display='none'; }
+
+  function close(){
+    var m=$('authModal'); if(m) m.style.display='none';
+  }
+
   function _setModalType(t){
     _type=t;
     var dt=$('demoTab'); if(dt) dt.className='mtab'+(t==='demo'?' active':'');
@@ -1854,36 +1859,60 @@ var Auth = (function(){
     var rw=$('rwarn'); if(rw) rw.style.display=t==='real'?'block':'none';
     var sd=$('authStepDemo'); if(sd) sd.style.display=t==='demo'?'block':'none';
     var sr=$('authStepReal'); if(sr) sr.style.display=t==='real'?'block':'none';
-    var sl=$('authStepLabel'); if(sl) sl.textContent='How to get your '+(t==='demo'?'DEMO':'REAL')+' token:';
+    var sl=$('authStepLabel'); if(sl) sl.textContent='Get your '+(t==='demo'?'DEMO':'REAL')+' account token:';
     var btn=$('authConnectBtn'); if(btn) btn.textContent='Connect '+(t==='demo'?'Demo':'Real')+' Account';
-    var ti=$('tokenIn'); if(ti) ti.placeholder='Paste your '+(t==='demo'?'DEMO':'REAL')+' account API token here...';
+    var ti=$('tokenIn'); if(ti) ti.placeholder='Paste your '+(t==='demo'?'DEMO':'REAL')+' API token here...';
   }
-  function switchType(t){ _setModalType(t); var ti=$('tokenIn'); if(ti){ ti.value=''; ti.focus(); } }
+
+  function switchType(t){
+    _setModalType(t);
+    var ti=$('tokenIn'); if(ti){ ti.value=''; ti.focus(); }
+  }
+
   function connect(){
-    var ti=$('tokenIn'); if(!ti){ _toast('Error','Token input not found','e'); return; }
+    var ti=$('tokenIn'); if(!ti) return;
     var raw=ti.value||'';
-    // Handle PAT tokens and clean whitespace
-    var t=raw.replace(/[\r\n\t]/g,'').replace(/\s/g,'').trim();
-    if((t[0]==='"'||t[0]==="'")&&(t[t.length-1]==='"'||t[t.length-1]==="'")){ t=t.substring(1,t.length-1); }
-    var isPAT = t.indexOf('pat_')===0;
-    console.log('[Auth] Token type:', isPAT?'PAT':'Standard', '| len:', t.length);
-    if(!t){ _toast('Token Required','Paste your Deriv API token in the box above','e',5000); ti.focus(); return; }
-    if(t.length<5){ _toast('Token Too Short','Copy the full token from app.deriv.com','e',5000); return; }
-    console.log('[Auth] Connecting | type:',_type,'| tokenLen:',t.length,'| first8:',t.substring(0,8));
+    var t=raw.replace(/[\r\n\t\s]/g,'').trim();
+    if(!t){
+      _toast('Token Required','Paste your Deriv API token above','e',5000);
+      ti.focus(); return;
+    }
+    if(t.length<4){
+      _toast('Invalid Token','Token too short. Copy it from app.deriv.com','e',5000);
+      return;
+    }
+    console.log('[Auth] Connecting | type:',_type,'| len:',t.length,'| prefix:',t.substring(0,10));
     var btn=$('authConnectBtn');
-    if(btn){ btn.textContent='Connecting...'; btn.disabled=true; setTimeout(function(){ btn.textContent='Connect '+(_type==='demo'?'Demo':'Real')+' Account'; btn.disabled=false; },10000); }
+    if(btn){ btn.textContent='Connecting...'; btn.disabled=true;
+      setTimeout(function(){ btn.textContent='Connect '+(_type==='demo'?'Demo':'Real')+' Account'; btn.disabled=false; },15000);
+    }
     close();
     ti.value='';
     setTimeout(function(){ API.connect(t,_type); },200);
   }
+
   function oauth(){
-    var url='https://oauth.deriv.com/oauth2/authorize?app_id=1089&l=EN&brand=deriv';
-    console.log('[OAuth] Redirecting to:',url);
-    _toast('Redirecting to Deriv OAuth...','Login to Deriv - you will return automatically','i',3000);
-    setTimeout(function(){window.location.href=url;},600);
+    // Build OAuth URL with redirect back to this exact page
+    var currentUrl=window.location.origin+window.location.pathname;
+    // Remove trailing slash for consistency
+    if(currentUrl.charAt(currentUrl.length-1)==='/') currentUrl=currentUrl.slice(0,-1);
+    var redirectUri=encodeURIComponent(currentUrl);
+    // Use app_id=1089 - this is Deriv's public app
+    // Tokens returned work with ANY app on ws.derivws.com
+    var url='https://oauth.deriv.com/oauth2/authorize';
+    url+='?app_id=1089';
+    url+='&l=EN';
+    url+='&brand=deriv';
+    console.log('[OAuth] Redirecting to Deriv login...',url);
+    _toast('Opening Deriv Login...','You will be redirected back automatically after login','i',4000);
+    // Small delay so toast shows before redirect
+    setTimeout(function(){
+      window.location.href=url;
+    },600);
   }
+
   return{show:show,close:close,switchType:switchType,connect:connect,oauth:oauth};
-})();
+})();)();
 
 /* DASHBOARD */
 var Dashboard = (function(){
@@ -2246,36 +2275,86 @@ function _wire(){
 /* BOOT */
 window.addEventListener('DOMContentLoaded',function(){
   console.log('[NEXUS TRADE] Booting...');
+
+  // Step 1: Init modules
   try{ Bots.init(); }catch(e){ console.error('[Boot] Bots:',e.message); }
   try{ Ticker.startSim(); }catch(e){ console.error('[Boot] Ticker:',e.message); }
   try{ Markets.render(); }catch(e){ console.error('[Boot] Markets:',e.message); }
-  try{ _wire(); console.log('[Boot] Buttons wired OK'); }catch(e){ console.error('[Boot] _wire failed:',e.message); }
-  /* Check for OAuth redirect callback */
+
+  // Step 2: Wire all buttons
+  try{ _wire(); console.log('[Boot] Buttons wired OK'); }
+  catch(e){
+    console.error('[Boot] _wire failed:',e.message);
+    // Emergency wire connect button
+    try{
+      var cb=document.getElementById('connBtn'); if(cb) cb.onclick=function(){Auth.show();};
+      var ab=document.getElementById('authConnectBtn'); if(ab) ab.onclick=function(){Auth.connect();};
+      var ob=document.getElementById('authOAuthBtn'); if(ob) ob.onclick=function(){Auth.oauth();};
+      var dt=document.getElementById('demoTab'); if(dt) dt.onclick=function(){Auth.switchType('demo');};
+      var rt=document.getElementById('realTab'); if(rt) rt.onclick=function(){Auth.switchType('real');};
+      var ac=document.getElementById('authClose'); if(ac) ac.onclick=function(){Auth.close();};
+    }catch(e2){ console.error('[Boot] Emergency wire failed:',e2.message); }
+  }
+
+  // Step 3: Check for Deriv OAuth callback
+  // Deriv redirects back with: ?acct1=CRxxx&token1=xxx&cur1=USD
+  // Multiple accounts: acct1+token1+cur1, acct2+token2+cur2, etc.
   try{
-    var urlParams = new URLSearchParams(window.location.search);
-    /* Deriv OAuth returns: ?acct1=CR...&token1=xxx&cur1=USD */
-    var oauthToken = urlParams.get('token1') || urlParams.get('token');
-    var oauthAcct  = urlParams.get('acct1')  || urlParams.get('acct');
-    var oauthCur   = urlParams.get('cur1')   || urlParams.get('cur');
-    if(oauthToken && oauthToken.length > 4){
-      /* Clean URL immediately */
-      window.history.replaceState({}, document.title, window.location.pathname);
-      /* Detect account type from prefix: VRTC = virtual/demo */
-      var isDemo = oauthAcct && (oauthAcct.indexOf('VRTC')===0 || oauthAcct.indexOf('VRT')===0);
-      var oauthType = isDemo ? 'demo' : 'real';
-      console.log('[OAuth] Callback | acct:', oauthAcct, '| type:', oauthType, '| cur:', oauthCur);
-      _toast('OAuth Login Successful!',
-        'Connecting ' + oauthType.toUpperCase() + ' account: ' + (oauthAcct||'') + ' (' + (oauthCur||'') + ')',
-        's', 5000);
-      /* Close auth modal if open */
+    var urlParams=new URLSearchParams(window.location.search);
+    var oauthToken=urlParams.get('token1')||urlParams.get('token');
+    var oauthAcct=urlParams.get('acct1')||urlParams.get('acct');
+    var oauthCur=urlParams.get('cur1')||urlParams.get('cur');
+
+    if(oauthToken && oauthToken.length>4){
+      // OAuth callback detected!
+      console.log('[OAuth] CALLBACK DETECTED | acct:',oauthAcct,'| cur:',oauthCur,'| tokenLen:',oauthToken.length);
+
+      // Clean URL (remove tokens from address bar)
+      try{ window.history.replaceState({},document.title,window.location.pathname); }catch(e){}
+
+      // Detect Demo vs Real
+      // VRTC prefix = virtual/demo account
+      // CR, MF, MLT, MX etc = real account
+      var isDemo=oauthAcct&&(oauthAcct.indexOf('VRTC')===0||oauthAcct.indexOf('VRT')===0);
+      var oauthType=isDemo?'demo':'real';
+
+      console.log('[OAuth] Account type:',oauthType,'| account:',oauthAcct,'| currency:',oauthCur);
+
+      // Close modal if open
       try{ Auth.close(); }catch(e){}
-      /* Connect with the token */
-      setTimeout(function(){ API.connect(oauthToken, oauthType); }, 600);
+
+      // Show connecting message
+      _toast(
+        'OAuth Login Successful!',
+        'Connecting '+oauthType.toUpperCase()+' account: '+(oauthAcct||'')+' ('+(oauthCur||'')+')...',
+        's', 6000
+      );
+
+      // Connect with the OAuth token
+      setTimeout(function(){
+        console.log('[OAuth] Connecting account...');
+        API.connect(oauthToken, oauthType);
+      }, 800);
+
+      // Also check if there are multiple accounts (acct2, acct3 etc)
+      var acct2=urlParams.get('acct2');
+      var token2=urlParams.get('token2');
+      if(acct2&&token2){
+        console.log('[OAuth] Additional account available:',acct2,'- user can switch later');
+      }
+
     } else {
-      setTimeout(function(){ try{ Auth.show(); }catch(e){ console.error('[Boot] Auth.show:',e.message); } }, 400);
+      // No OAuth callback - show login modal
+      setTimeout(function(){
+        try{ Auth.show(); }catch(e){ console.error('[Boot] Auth.show:',e.message); }
+      },400);
     }
-  }catch(e){ console.error('[Boot] OAuth:',e.message); setTimeout(function(){ try{ Auth.show(); }catch(e2){} },400); }
-  /* Keep toggle buttons in sync */
+  }catch(e){
+    console.error('[Boot] OAuth check failed:',e.message);
+    setTimeout(function(){ try{Auth.show();}catch(e2){} },400);
+  }
+
+  // Step 4: Keep toggle buttons in sync
   setInterval(function(){
     try{
       var on=S.autoTrade;
@@ -2284,8 +2363,9 @@ window.addEventListener('DOMContentLoaded',function(){
       var l=$('atLbl'); if(l) l.textContent=on?'ON':'OFF';
     }catch(e){}
   },800);
+
   console.log('[NEXUS TRADE] Boot complete');
-});
+}););
 
 </script>
 </body>
